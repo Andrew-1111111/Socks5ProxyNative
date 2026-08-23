@@ -44,20 +44,43 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: pwsh
         run: |
-          $notes = @"
-          A lightweight and high-performance proxy server designed for secure and reliable network routing.
-
-          Automated build: ${{ github.sha }}
-          "@
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          @(
+            'A high-performance SOCKS5 proxy in C++20 (Windows, IOCP) with outbound traffic binding to a chosen interface, built-in DNS resolution, and detailed logging.'
+            ''
+            '## Features'
+            ''
+            '- Full baseline SOCKS5 (RFC 1928) support for CONNECT and UDP ASSOCIATE'
+            '- IPv4, IPv6, and domain names'
+            '- Asynchronous IOCP architecture for many concurrent connections'
+            '- Bind outbound TCP/UDP to a specific local IP or interface name'
+            '- Built-in DNS with caching, EDNS, retries, and TCP fallback'
+            '- Authentication: No Auth, Username/Password, and GSSAPI (Windows SSPI)'
+            '- UDP relay with client validation, source filtering, and idle timeout'
+            '- Friendly IP names in logs and configurable console logging'
+            ''
+            '## Requirements'
+            ''
+            '- Windows 10/11 (x64)'
+            '- Administrator privileges'
+            ''
+            '## Assets'
+            ''
+            '- Socks5Proxy.exe — application'
+            '- proxy.json — example configuration (edit before use)'
+            ''
+            "Automated build: ${{ github.sha }}"
+          ) | Set-Content -Path dist/RELEASE_NOTES.md -Encoding utf8
 
           gh release view x64 2>$null
           if ($LASTEXITCODE -ne 0) {
             gh release create x64 `
               --title "Windows x64" `
-              --notes "$notes" `
+              --notes-file dist/RELEASE_NOTES.md `
               dist/Socks5Proxy.exe `
               dist/proxy.json
           } else {
+            gh release edit x64 --notes-file dist/RELEASE_NOTES.md
             gh release upload x64 `
               --clobber `
               dist/Socks5Proxy.exe `
