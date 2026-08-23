@@ -1,0 +1,39 @@
+{
+  "ListenIPAddress": "0.0.0.0",
+  "ListenPort": 1080,
+  "OutputIPAddress": [],
+  "OutputInterfaceName": [
+    "tap1",
+    "tun2"
+  ],
+  "DnsServer": "8.8.8.8",
+  "MaxConnections": 1000,
+  "RunDelayS": 0,
+  "Username": "",
+  "Password": "",
+  "EnableGssapi": false,
+  "GssapiMaxProtection": 1,
+  "IdleTimeoutMs": 60000,
+  "ConnectTimeoutMs": 30000,
+  "SendTimeoutMs": 30000,
+  "ReceiveTimeoutMs": 30000,
+  "DnsSendTimeoutMs": 5000,
+  "DnsReceiveTimeoutMs": 5000,
+  "UdpAssociateIdleTimeoutMs": 120000,
+  "SendBufferSize": 262144,
+  "ReceiveBufferSize": 262144,
+  "BufferSize": 81920,
+  "NoDelay": true,
+  "KeepAlive": true,
+  "LingerEnabled": false,
+  "LingerTimeoutSec": 0,
+  "TcpKeepAliveTime": 60,
+  "TcpKeepAliveInterval": 10,
+  "TcpKeepAliveRetryCount": 5,
+  "IPAddressMappings": [
+    {
+      "IPAddress": "192.168.0.10",
+      "FriendlyName": "PC_1"
+    }
+  ]
+}

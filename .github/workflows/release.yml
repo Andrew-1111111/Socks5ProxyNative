@@ -1,0 +1,65 @@
+name: Release Windows x64
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v3
+
+      - name: Build Release x64
+        run: msbuild Socks5Proxy.sln /p:Configuration=Release /p:Platform=x64 /m /v:minimal
+
+      - name: Prepare artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item bin\x64\Release\Socks5Proxy.exe dist\
+          Copy-Item proxy.json dist\
+
+      - name: Move x64 tag to current commit
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -fa x64 -m "Windows x64"
+          git push origin x64 --force
+
+      - name: Create or update release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $notes = @"
+          A lightweight and high-performance proxy server designed for secure and reliable network routing.
+
+          Automated build: ${{ github.sha }}
+          "@
+
+          gh release view x64 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create x64 `
+              --title "Windows x64" `
+              --notes "$notes" `
+              dist/Socks5Proxy.exe `
+              dist/proxy.json
+          } else {
+            gh release upload x64 `
+              --clobber `
+              dist/Socks5Proxy.exe `
+              dist/proxy.json
+          }

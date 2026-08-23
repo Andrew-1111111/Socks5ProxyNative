@@ -1,0 +1,187 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{4FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\config">
+      <UniqueIdentifier>{1A2B3C4D-5E6F-7081-9293-A4B5C6D7E8F0}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\network">
+      <UniqueIdentifier>{2B3C4D5E-6F70-8192-A3B4-C5D6E7F8091A}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\utils">
+      <UniqueIdentifier>{3C4D5E6F-7081-92A3-B4C5-D6E7F8091A2B}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\friendly">
+      <UniqueIdentifier>{4D5E6F70-8192-A3B4-C5D6-E7F8091A2B3C}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\helper">
+      <UniqueIdentifier>{5E6F7081-92A3-B4C5-D6E7-F8091A2B3C4D}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\server">
+      <UniqueIdentifier>{6F708192-A3B4-C5D6-E7F8-091A2B3C4D5E}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\server\protocol">
+      <UniqueIdentifier>{708192A3-B4C5-D6E7-F809-1A2B3C4D5E6F}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\dns">
+      <UniqueIdentifier>{F8091A2B-3C4D-5E6F-7081-92A3B4C5D6E7}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files">
+      <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\dns">
+      <UniqueIdentifier>{091A2B3C-4D5E-6F70-8192-A3B4C5D6E7F8}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\config">
+      <UniqueIdentifier>{8192A3B4-C5D6-E7F8-091A-2B3C4D5E6F70}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\network">
+      <UniqueIdentifier>{92A3B4C5-D6E7-F809-1A2B-3C4D5E6F7081}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\utils">
+      <UniqueIdentifier>{A3B4C5D6-E7F8-091A-2B3C-4D5E6F708192}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\friendly">
+      <UniqueIdentifier>{B4C5D6E7-F809-1A2B-3C4D-5E6F708192A3}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\helper">
+      <UniqueIdentifier>{C5D6E7F8-091A-2B3C-4D5E-6F708192A3B4}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\server">
+      <UniqueIdentifier>{D6E7F809-1A2B-3C4D-5E6F-708192A3B4C5}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\server\protocol">
+      <UniqueIdentifier>{E7F8091A-2B3C-4D5E-6F70-8192A3B4C5D6}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Resource Files">
+      <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="Socks5Proxy.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="config\NetworkConfiguration.cpp">
+      <Filter>Source Files\config</Filter>
+    </ClCompile>
+    <ClCompile Include="config\ProxyConfiguration.cpp">
+      <Filter>Source Files\config</Filter>
+    </ClCompile>
+    <ClCompile Include="network\Network.cpp">
+      <Filter>Source Files\network</Filter>
+    </ClCompile>
+    <ClCompile Include="network\Iocp.cpp">
+      <Filter>Source Files\network</Filter>
+    </ClCompile>
+    <ClCompile Include="utils\Logger.cpp">
+      <Filter>Source Files\utils</Filter>
+    </ClCompile>
+    <ClCompile Include="utils\Application.cpp">
+      <Filter>Source Files\utils</Filter>
+    </ClCompile>
+    <ClCompile Include="friendly\FriendlyNameResolver.cpp">
+      <Filter>Source Files\friendly</Filter>
+    </ClCompile>
+    <ClCompile Include="helper\NetworkMonitoring.cpp">
+      <Filter>Source Files\helper</Filter>
+    </ClCompile>
+    <ClCompile Include="server\ProxyServer.cpp">
+      <Filter>Source Files\server</Filter>
+    </ClCompile>
+    <ClCompile Include="dns\DnsClient.cpp">
+      <Filter>Source Files\dns</Filter>
+    </ClCompile>
+    <ClCompile Include="dns\DnsResolver.cpp">
+      <Filter>Source Files\dns</Filter>
+    </ClCompile>
+    <ClCompile Include="network\TcpAcceptor.cpp">
+      <Filter>Source Files\network</Filter>
+    </ClCompile>
+    <ClCompile Include="server\protocol\UdpRelay.cpp">
+      <Filter>Source Files\server\protocol</Filter>
+    </ClCompile>
+    <ClCompile Include="server\protocol\GssapiContext.cpp">
+      <Filter>Source Files\server\protocol</Filter>
+    </ClCompile>
+    <ClCompile Include="server\protocol\Socks5Session.cpp">
+      <Filter>Source Files\server\protocol</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="Socks5Proxy.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="config\NetworkConfiguration.h">
+      <Filter>Header Files\config</Filter>
+    </ClInclude>
+    <ClInclude Include="config\ProxyConfiguration.h">
+      <Filter>Header Files\config</Filter>
+    </ClInclude>
+    <ClInclude Include="network\Network.h">
+      <Filter>Header Files\network</Filter>
+    </ClInclude>
+    <ClInclude Include="network\Iocp.h">
+      <Filter>Header Files\network</Filter>
+    </ClInclude>
+    <ClInclude Include="utils\Logger.h">
+      <Filter>Header Files\utils</Filter>
+    </ClInclude>
+    <ClInclude Include="utils\Application.h">
+      <Filter>Header Files\utils</Filter>
+    </ClInclude>
+    <ClInclude Include="friendly\FriendlyNameResolver.h">
+      <Filter>Header Files\friendly</Filter>
+    </ClInclude>
+    <ClInclude Include="helper\NetworkMonitoring.h">
+      <Filter>Header Files\helper</Filter>
+    </ClInclude>
+    <ClInclude Include="server\ProxyServer.h">
+      <Filter>Header Files\server</Filter>
+    </ClInclude>
+    <ClInclude Include="server\protocol\Socks5Constants.h">
+      <Filter>Header Files\server\protocol</Filter>
+    </ClInclude>
+    <ClInclude Include="dns\DnsClient.h">
+      <Filter>Header Files\dns</Filter>
+    </ClInclude>
+    <ClInclude Include="dns\DnsResolver.h">
+      <Filter>Header Files\dns</Filter>
+    </ClInclude>
+    <ClInclude Include="network\TcpAcceptor.h">
+      <Filter>Header Files\network</Filter>
+    </ClInclude>
+    <ClInclude Include="server\protocol\UdpRelay.h">
+      <Filter>Header Files\server\protocol</Filter>
+    </ClInclude>
+    <ClInclude Include="server\protocol\GssapiContext.h">
+      <Filter>Header Files\server\protocol</Filter>
+    </ClInclude>
+    <ClInclude Include="server\protocol\Socks5Session.h">
+      <Filter>Header Files\server\protocol</Filter>
+    </ClInclude>
+    <ClInclude Include="resource.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="Socks5Proxy.rc">
+      <Filter>Resource Files</Filter>
+    </ResourceCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="proxy.json">
+      <Filter>Resource Files</Filter>
+    </None>
+    <None Include="console.ico">
+      <Filter>Resource Files</Filter>
+    </None>
+    <None Include="CMakeLists.txt">
+      <Filter>Resource Files</Filter>
+    </None>
+    <None Include="CMakePresets.json">
+      <Filter>Resource Files</Filter>
+    </None>
+  </ItemGroup>
+</Project>
