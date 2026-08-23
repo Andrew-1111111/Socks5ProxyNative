@@ -7,32 +7,43 @@
 #endif
 #include <windows.h>
 #include <shellapi.h>
-#include <tlhelp32.h>
 
 #include <filesystem>
 #include <string>
 
 namespace {
 
-SECURITY_ATTRIBUTES MakeEveryoneSa(SECURITY_DESCRIPTOR& sd) {
-    InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
-    // NULL DACL = full access for everyone (needed so admin/non-admin and C#/C++ share the mutex)
-    SetSecurityDescriptorDacl(&sd, TRUE, nullptr, FALSE);
-    SECURITY_ATTRIBUTES sa{};
-    sa.nLength = sizeof(sa);
-    sa.lpSecurityDescriptor = &sd;
-    sa.bInheritHandle = FALSE;
-    return sa;
+std::wstring CurrentCommandLineParameters() {
+    const wchar_t* commandLine = GetCommandLineW();
+    if (!commandLine) {
+        return {};
+    }
+
+    const wchar_t* p = commandLine;
+    if (*p == L'"') {
+        ++p;
+        while (*p && *p != L'"') {
+            ++p;
+        }
+        if (*p == L'"') {
+            ++p;
+        }
+    } else {
+        while (*p && *p != L' ' && *p != L'\t') {
+            ++p;
+        }
+    }
+    while (*p == L' ' || *p == L'\t') {
+        ++p;
+    }
+    return p;
 }
 
 }  // namespace
 
 bool SingleInstanceGuard::TryAcquire() {
-    SECURITY_DESCRIPTOR sd{};
-    SECURITY_ATTRIBUTES sa = MakeEveryoneSa(sd);
-
     SetLastError(ERROR_SUCCESS);
-    HANDLE handle = CreateMutexW(&sa, TRUE, mutexName_.c_str());
+    HANDLE handle = CreateMutexW(nullptr, TRUE, mutexName_.c_str());
     if (!handle) {
         return false;
     }
@@ -60,63 +71,10 @@ void SingleInstanceGuard::ReleaseHandle() {
     mutex_ = nullptr;
 }
 
-void SingleInstanceGuard::CloseOtherSocks5Processes() {
-    const DWORD self = GetCurrentProcessId();
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snapshot == INVALID_HANDLE_VALUE) {
-        return;
-    }
-
-    PROCESSENTRY32W entry{};
-    entry.dwSize = sizeof(entry);
-
-    int closed = 0;
-    if (Process32FirstW(snapshot, &entry)) {
-        do {
-            if (entry.th32ProcessID == self) {
-                continue;
-            }
-            // Same process name as C# publish output and this C++ binary
-            if (_wcsicmp(entry.szExeFile, L"Socks5Proxy.exe") != 0) {
-                continue;
-            }
-
-            HANDLE process = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, entry.th32ProcessID);
-            if (!process) {
-                continue;
-            }
-
-            if (TerminateProcess(process, 0)) {
-                WaitForSingleObject(process, 5000);
-                ++closed;
-            }
-            CloseHandle(process);
-        } while (Process32NextW(snapshot, &entry));
-    }
-
-    CloseHandle(snapshot);
-
-    if (closed > 0) {
-        Logger::Instance().Info("Closed {Count} previous Socks5Proxy instance(s).", closed);
-    }
-}
-
 SingleInstanceGuard::SingleInstanceGuard(const std::wstring& appId)
     : mutexName_(L"Global\\" + appId) {
-    // Same name as C#: new Mutex(true, $"Global\\{appId}", ...)
     if (TryAcquire()) {
         return;
-    }
-
-    // C# SingleInstanceGuard only blocks a second start — it never kills the first process.
-    // Here we take over: close other Socks5Proxy.exe (C# or C++), then reclaim the mutex.
-    CloseOtherSocks5Processes();
-
-    for (int attempt = 0; attempt < 50; ++attempt) {
-        Sleep(100);
-        if (TryAcquire()) {
-            return;
-        }
     }
 
     isRunning_ = true;
@@ -159,6 +117,8 @@ bool AdminLauncher::EnsureElevatedOrRelaunch() {
     sei.fMask = SEE_MASK_NOCLOSEPROCESS;
     sei.lpVerb = L"runas";
     sei.lpFile = path;
+    const std::wstring parameters = CurrentCommandLineParameters();
+    sei.lpParameters = parameters.empty() ? nullptr : parameters.c_str();
     sei.nShow = SW_SHOWNORMAL;
 
     if (!ShellExecuteExW(&sei)) {
@@ -182,6 +142,8 @@ void AdminLauncher::RestartApplication(bool requestElevation) {
     sei.cbSize = sizeof(sei);
     sei.lpVerb = requestElevation ? L"runas" : L"open";
     sei.lpFile = path;
+    const std::wstring parameters = CurrentCommandLineParameters();
+    sei.lpParameters = parameters.empty() ? nullptr : parameters.c_str();
     sei.nShow = SW_SHOWNORMAL;
     ShellExecuteExW(&sei);
     ExitProcess(0);
@@ -205,7 +167,11 @@ bool WindowsFirewall::AllowApplication(const std::string& appPath, const std::st
                             CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
             return false;
         }
-        WaitForSingleObject(pi.hProcess, 15000);
+        const DWORD waitResult = WaitForSingleObject(pi.hProcess, 15000);
+        if (waitResult == WAIT_TIMEOUT) {
+            TerminateProcess(pi.hProcess, ERROR_TIMEOUT);
+            WaitForSingleObject(pi.hProcess, 5000);
+        }
         DWORD code = 1;
         GetExitCodeProcess(pi.hProcess, &code);
         CloseHandle(pi.hThread);

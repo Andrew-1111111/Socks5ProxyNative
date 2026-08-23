@@ -4,14 +4,24 @@
 #include "../dns/DnsResolver.h"
 #include "Iocp.h"
 
+#include <WinSock2.h>
+#include <ws2def.h>
+#include <ws2ipdef.h>
+#include <WS2tcpip.h>
 #include <windows.h>
 #include <iphlpapi.h>
+#include <IPTypes.h>
+#include <ifdef.h>
+#include <ipifcons.h>
 
+#include <cctype>
 #include <chrono>
+#include <cstdint>
 #include <cstring>
 #include <future>
 #include <memory>
 #include <optional>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -281,13 +291,13 @@ bool NetworkUtils::CheckDns(const std::string& dnsServer, const std::string& loc
 
     bool ok = false;
     for (int attempt = 1; attempt <= retries && !ok; ++attempt) {
-        std::promise<bool> prom;
-        auto fut = prom.get_future();
+        auto prom = std::make_shared<std::promise<bool>>();
+        auto fut = prom->get_future();
         resolver->ResolveAsync(
             "google.com",
-            [&prom](std::optional<std::string> ip) {
+            [prom](std::optional<std::string> ip) {
                 try {
-                    prom.set_value(ip.has_value());
+                    prom->set_value(ip.has_value());
                 } catch (...) {
                 }
             },

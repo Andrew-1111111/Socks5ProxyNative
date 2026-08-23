@@ -4,14 +4,45 @@
 #include "../network/Network.h"
 #include "../utils/Logger.h"
 
+#include <WinSock2.h>
+#include <Windows.h>
+
 #include <cctype>
+#include <cstdint>
 #include <cstring>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace {
 
 std::string ToLower(std::string s) {
     for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     return s;
+}
+
+bool SameEndpoint(const sockaddr_storage& lhs, const sockaddr_storage& rhs) {
+    if (lhs.ss_family != rhs.ss_family) {
+        return false;
+    }
+    if (lhs.ss_family == AF_INET) {
+        const auto* a = reinterpret_cast<const sockaddr_in*>(&lhs);
+        const auto* b = reinterpret_cast<const sockaddr_in*>(&rhs);
+        return a->sin_port == b->sin_port &&
+               a->sin_addr.s_addr == b->sin_addr.s_addr;
+    }
+    if (lhs.ss_family == AF_INET6) {
+        const auto* a = reinterpret_cast<const sockaddr_in6*>(&lhs);
+        const auto* b = reinterpret_cast<const sockaddr_in6*>(&rhs);
+        return a->sin6_port == b->sin6_port &&
+               std::memcmp(&a->sin6_addr, &b->sin6_addr, sizeof(a->sin6_addr)) == 0 &&
+               a->sin6_scope_id == b->sin6_scope_id;
+    }
+    return false;
 }
 
 }  // namespace
@@ -33,7 +64,21 @@ public:
         }
     }
 
+    void Cancel() {
+        std::lock_guard lock(stateMutex_);
+        done_ = true;
+        if (socket_ != INVALID_SOCKET) {
+            closesocket(socket_);
+            socket_ = INVALID_SOCKET;
+        }
+    }
+
     bool Start() {
+        std::lock_guard lock(stateMutex_);
+        if (done_) {
+            return false;
+        }
+
         sockaddr_storage bindAddr{};
         int bindLen = 0;
         if (!NetworkConfiguration::FillOutputBindAddress(bindAddr, bindLen)) {
@@ -62,7 +107,7 @@ public:
             return false;
         }
 
-        if (!parent_.iocp_.Associate(socket_, this)) {
+        if (!parent_.iocp_.Associate(socket_, shared_from_this())) {
             closesocket(socket_);
             socket_ = INVALID_SOCKET;
             return false;
@@ -71,10 +116,11 @@ public:
         phase_ = Phase::Connect;
         return parent_.iocp_.PostConnect(socket_, &connectCtx_,
                                          reinterpret_cast<sockaddr*>(&parent_.dnsAddr_),
-                                         parent_.dnsAddrLen_, this);
+                                         parent_.dnsAddrLen_, shared_from_this());
     }
 
     void OnIoCompleted(DWORD bytes, DWORD error, IoContext* ctx) override {
+        std::lock_guard lock(stateMutex_);
         if (done_) return;
 
         if (error != 0) {
@@ -92,7 +138,7 @@ public:
             sendCtx_.buffer[1] = static_cast<char>(query_.size() & 0xFF);
             std::memcpy(sendCtx_.buffer.data() + 2, query_.data(), query_.size());
             phase_ = Phase::Send;
-            if (!parent_.iocp_.PostSend(socket_, &sendCtx_, 0, sendCtx_.buffer.size(), this)) {
+            if (!parent_.iocp_.PostSend(socket_, &sendCtx_, 0, sendCtx_.buffer.size(), shared_from_this())) {
                 Fail();
             }
             break;
@@ -101,7 +147,7 @@ public:
             if (bytes < sendCtx_.sendLength) {
                 const size_t next = sendCtx_.sendOffset + bytes;
                 const size_t left = sendCtx_.sendLength - bytes;
-                if (!parent_.iocp_.PostSend(socket_, &sendCtx_, next, left, this)) {
+                if (!parent_.iocp_.PostSend(socket_, &sendCtx_, next, left, shared_from_this())) {
                     Fail();
                 }
                 return;
@@ -109,7 +155,7 @@ public:
             recvNeed_ = 2;
             recvGot_ = 0;
             phase_ = Phase::RecvLen;
-            if (!parent_.iocp_.PostRecv(socket_, &recvCtx_, this)) {
+            if (!parent_.iocp_.PostRecv(socket_, &recvCtx_, shared_from_this())) {
                 Fail();
             }
             break;
@@ -138,19 +184,8 @@ private:
         if (recvCtx_.buffer.size() < recvNeed_) {
             recvCtx_.buffer.resize(recvNeed_);
         }
-        recvCtx_.Reset(IoOp::Recv);
-        recvCtx_.socket = socket_;
-        recvCtx_.wsaBuf.buf = recvCtx_.buffer.data() + recvGot_;
-        recvCtx_.wsaBuf.len = static_cast<ULONG>(recvNeed_ - recvGot_);
-        recvCtx_.flags = 0;
-        AddPending();
-        DWORD recvd = 0;
-        const int r = WSARecv(socket_, &recvCtx_.wsaBuf, 1, &recvd, &recvCtx_.flags, &recvCtx_, nullptr);
-        if (r == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING) {
-            ReleasePending();
-            return false;
-        }
-        return true;
+        return parent_.iocp_.PostRecv(socket_, &recvCtx_, shared_from_this(),
+                                      recvGot_, recvNeed_ - recvGot_);
     }
 
     bool ContinueRecv() {
@@ -208,6 +243,7 @@ private:
     size_t recvNeed_ = 0;
     size_t recvGot_ = 0;
     bool done_ = false;
+    std::mutex stateMutex_;
 };
 
 DnsResolver::DnsResolver(IocpService& iocp, const std::string& dnsServer)
@@ -271,7 +307,7 @@ bool DnsResolver::Start() {
         return false;
     }
 
-    if (!iocp_.Associate(udpSocket_, this)) {
+    if (!iocp_.Associate(udpSocket_, shared_from_this())) {
         closesocket(udpSocket_);
         udpSocket_ = INVALID_SOCKET;
         started_ = false;
@@ -279,7 +315,7 @@ bool DnsResolver::Start() {
     }
 
     recvPosted_ = false;
-    if (!iocp_.PostRecvFrom(udpSocket_, &recvCtx_, this)) {
+    if (!iocp_.PostRecvFrom(udpSocket_, &recvCtx_, shared_from_this())) {
         closesocket(udpSocket_);
         udpSocket_ = INVALID_SOCKET;
         started_ = false;
@@ -290,6 +326,7 @@ bool DnsResolver::Start() {
 }
 
 void DnsResolver::Stop() {
+    std::unique_lock completionLock(completionMutex_);
     if (!started_) {
         return;
     }
@@ -305,11 +342,9 @@ void DnsResolver::Stop() {
         byId_.clear();
         byDomain_.clear();
         pendingSends_.clear();
-        inFlightSends_.clear();
-        sendsInFlight_ = 0;
     }
 
-    std::vector<std::shared_ptr<IocpHandle>> tcpPins;
+    std::vector<std::shared_ptr<TcpDnsQuery>> tcpPins;
     for (auto& q : pending) {
         for (auto& cb : q->callbacks) {
             if (cb) cb(std::nullopt);
@@ -326,10 +361,20 @@ void DnsResolver::Stop() {
         udpSocket_ = INVALID_SOCKET;
     }
 
+    completionLock.unlock();
+
     for (auto& t : tcpPins) {
-        if (t) t->WaitPendingZero(3000);
+        if (t) {
+            t->Cancel();
+        }
     }
-    WaitPendingZero(5000);
+
+    for (auto& t : tcpPins) {
+        if (t) {
+            t->WaitPendingZero(-1);
+        }
+    }
+    WaitPendingZero(-1);
     started_ = false;
 }
 
@@ -357,7 +402,16 @@ void DnsResolver::ResolveAsync(std::string domainRaw, Callback callback, bool us
     }
 
     if (auto it = byDomain_.find(domain); it != byDomain_.end()) {
+        if (it->second->callbacks.size() >= kMaxCallbacksPerQuery) {
+            callback(std::nullopt);
+            return;
+        }
+        it->second->useCache = it->second->useCache && useCache;
         it->second->callbacks.push_back(std::move(callback));
+        return;
+    }
+    if (byDomain_.size() >= kMaxPendingQueries) {
+        callback(std::nullopt);
         return;
     }
 
@@ -376,13 +430,18 @@ void DnsResolver::ResolveAsync(std::string domainRaw, Callback callback, bool us
 
 uint16_t DnsResolver::AllocTxidLocked() {
     for (int i = 0; i < 10000; ++i) {
-        const uint16_t id = static_cast<uint16_t>(idSeq_.fetch_add(1));
+        const uint16_t id = DnsClient::GenerateId();
         if (id == 0) continue;
         if (byId_.find(id) == byId_.end()) {
             return id;
         }
     }
-    return DnsClient::GenerateId();
+    for (;;) {
+        const uint16_t id = static_cast<uint16_t>(idSeq_.fetch_add(1));
+        if (id != 0 && byId_.find(id) == byId_.end()) {
+            return id;
+        }
+    }
 }
 
 void DnsResolver::BeginUdpQueryLocked(std::shared_ptr<PendingQuery> pending) {
@@ -390,7 +449,9 @@ void DnsResolver::BeginUdpQueryLocked(std::shared_ptr<PendingQuery> pending) {
     ++pending->udpAttempts;
     try {
         auto query = DnsClient::BuildQuery(pending->domain, pending->txid, pending->qtype);
-        ArmTimerLocked(*pending);
+        if (!ArmTimerLocked(*pending)) {
+            throw std::runtime_error("Failed to schedule DNS timeout");
+        }
         EnqueueUdpSendLocked(std::move(query));
     } catch (...) {
         byId_.erase(pending->txid);
@@ -411,6 +472,9 @@ void DnsResolver::RetryUdpQueryLocked(std::shared_ptr<PendingQuery> pending) {
 }
 
 void DnsResolver::EnqueueUdpSendLocked(std::vector<uint8_t> query) {
+    if (udpSocket_ == INVALID_SOCKET || pendingSends_.size() >= kMaxPendingSends) {
+        return;
+    }
     auto out = std::make_unique<Outbound>();
     out->data.assign(reinterpret_cast<const char*>(query.data()),
                      reinterpret_cast<const char*>(query.data()) + query.size());
@@ -427,8 +491,10 @@ void DnsResolver::PumpSendLocked() {
         pendingSends_.pop_front();
         Outbound* raw = out.get();
         if (!iocp_.PostSendTo(udpSocket_, &raw->ctx, raw->data.data(), raw->data.size(),
-                              reinterpret_cast<sockaddr*>(&raw->to), raw->toLen, this)) {
-            continue;
+                              reinterpret_cast<sockaddr*>(&raw->to), raw->toLen, shared_from_this())) {
+            pendingSends_.push_front(std::move(out));
+            Logger::Instance().Warning("Failed to post DNS UDP send; waiting for retry.");
+            break;
         }
         inFlightSends_.push_back(std::move(out));
         ++sendsInFlight_;
@@ -451,12 +517,13 @@ void DnsResolver::OnUdpSendCompleted(IoContext* ctx) {
     }
 }
 
-void DnsResolver::ArmTimerLocked(PendingQuery& pending) {
+bool DnsResolver::ArmTimerLocked(PendingQuery& pending) {
     CancelTimerLocked(pending);
     const int timeoutMs = NetworkConfiguration::DnsReceiveTimeoutMs > 0
                               ? NetworkConfiguration::DnsReceiveTimeoutMs
                               : 3000;
-    pending.timerId = iocp_.ScheduleTimeout(this, (kTimeoutKey << 32) | pending.txid, timeoutMs);
+    pending.timerId = iocp_.ScheduleTimeout(shared_from_this(), (kTimeoutKey << 32) | pending.txid, timeoutMs);
+    return pending.timerId != 0;
 }
 
 void DnsResolver::CancelTimerLocked(PendingQuery& pending) {
@@ -471,15 +538,7 @@ void DnsResolver::HandleUdpResponse(const uint8_t* data, int length, const socka
         return;
     }
 
-    // Accept reply from any address: home routers/ISP often intercept 8.8.8.8 and
-    // answer from a different IP. Authenticity is tied to matching txid below.
-    uint16_t port = 0;
-    if (from.ss_family == AF_INET) {
-        port = ntohs(reinterpret_cast<const sockaddr_in*>(&from)->sin_port);
-    } else if (from.ss_family == AF_INET6) {
-        port = ntohs(reinterpret_cast<const sockaddr_in6*>(&from)->sin6_port);
-    }
-    if (port != 0 && port != 53) {
+    if (!SameEndpoint(from, dnsAddr_)) {
         return;
     }
 
@@ -495,10 +554,14 @@ void DnsResolver::HandleUdpResponse(const uint8_t* data, int length, const socka
     }
 
     auto result = DnsClient::ParseResponse(data, length, pending->txid, pending->qtype);
+    if (!result.fromNetwork) {
+        return;
+    }
     OnQueryResult(txid, result, false);
 }
 
 void DnsResolver::OnQueryResult(uint16_t txid, const DnsClient::DnsResult& result, bool fromTcp, bool isTimeout) {
+    std::lock_guard completionLock(completionMutex_);
     std::shared_ptr<PendingQuery> pending;
     {
         std::lock_guard lock(mutex_);
@@ -569,7 +632,6 @@ void DnsResolver::OnIoCompleted(DWORD bytes, DWORD error, IoContext* ctx) {
 
     if (ctx->op == IoOp::User) {
         const uint64_t key = ctx->userKey;
-        delete ctx;
         if ((key >> 32) == kTimeoutKey) {
             const uint16_t txid = static_cast<uint16_t>(key & 0xFFFF);
             OnQueryResult(txid, DnsClient::DnsResult::Invalid(), false, true);
@@ -590,8 +652,13 @@ void DnsResolver::OnIoCompleted(DWORD bytes, DWORD error, IoContext* ctx) {
         }
 
         if (!stopping_ && udpSocket_ != INVALID_SOCKET) {
-            if (iocp_.PostRecvFrom(udpSocket_, &recvCtx_, this)) {
+            if (iocp_.PostRecvFrom(udpSocket_, &recvCtx_, shared_from_this())) {
                 recvPosted_ = true;
+            } else {
+                Logger::Instance().Error(
+                    "Failed to repost DNS UDP receive; falling back to TCP for pending queries.");
+                closesocket(udpSocket_);
+                udpSocket_ = INVALID_SOCKET;
             }
         }
         return;
@@ -609,10 +676,15 @@ void DnsResolver::StartTcpFallback(std::shared_ptr<PendingQuery> pending) {
         return;
     }
 
+    bool timerArmed = false;
     {
         std::lock_guard lock(mutex_);
         pending->viaTcp = true;
-        ArmTimerLocked(*pending);
+        timerArmed = ArmTimerLocked(*pending);
+    }
+    if (!timerArmed) {
+        FinishQuery(pending, DnsClient::DnsResult::Invalid());
+        return;
     }
 
     auto tcp = std::make_shared<TcpDnsQuery>(*this, pending->txid, pending->qtype, std::move(query));

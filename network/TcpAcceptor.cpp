@@ -1,6 +1,15 @@
 #include "TcpAcceptor.h"
 
+#include "Iocp.h"
 #include "../utils/Logger.h"
+
+#include <WinSock2.h>
+#include <Windows.h>
+#include <MSWSock.h>
+
+#include <memory>
+#include <mutex>
+#include <utility>
 
 TcpAcceptor::TcpAcceptor(IocpService& iocp, SOCKET listenSocket, int family, AcceptCallback onAccept)
     : iocp_(iocp),
@@ -18,7 +27,7 @@ bool TcpAcceptor::Start(unsigned pendingAccepts) {
         return false;
     }
 
-    if (!iocp_.Associate(listenSocket_, this)) {
+    if (!iocp_.Associate(listenSocket_, shared_from_this())) {
         Logger::Instance().Error("Failed to associate listen socket with IOCP");
         return false;
     }
@@ -36,13 +45,8 @@ bool TcpAcceptor::Start(unsigned pendingAccepts) {
 }
 
 void TcpAcceptor::Stop() {
+    std::lock_guard completionLock(completionMutex_);
     stopping_ = true;
-    for (auto& io : accepts_) {
-        if (io && io->acceptSocket != INVALID_SOCKET) {
-            closesocket(io->acceptSocket);
-            io->acceptSocket = INVALID_SOCKET;
-        }
-    }
 }
 
 bool TcpAcceptor::PostAccept(AcceptIo& io) {
@@ -58,9 +62,14 @@ bool TcpAcceptor::PostAccept(AcceptIo& io) {
         return false;
     }
 
-    return iocp_.PostAccept(listenSocket_, io.acceptSocket, &io.ctx,
-                            io.addrBuf, static_cast<DWORD>(sizeof(io.addrBuf)),
-                            this, acceptEx_);
+    if (!iocp_.PostAccept(listenSocket_, io.acceptSocket, &io.ctx,
+                          io.addrBuf, static_cast<DWORD>(sizeof(io.addrBuf)),
+                          shared_from_this(), acceptEx_)) {
+        closesocket(io.acceptSocket);
+        io.acceptSocket = INVALID_SOCKET;
+        return false;
+    }
+    return true;
 }
 
 void TcpAcceptor::OnIoCompleted(DWORD bytes, DWORD error, IoContext* ctx) {
@@ -90,15 +99,21 @@ void TcpAcceptor::HandleAccept(AcceptIo& io, DWORD error) {
 
     if (error != 0 || client == INVALID_SOCKET) {
         if (client != INVALID_SOCKET) closesocket(client);
-        if (!stopping_) {
-            PostAccept(io);
+        if (!stopping_ && !PostAccept(io)) {
+            Logger::Instance().Error("Failed to repost AcceptEx after an accept error.");
         }
         return;
     }
 
     // Required after AcceptEx
-    setsockopt(client, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
-               reinterpret_cast<const char*>(&listenSocket_), sizeof(listenSocket_));
+    if (setsockopt(client, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
+                   reinterpret_cast<const char*>(&listenSocket_), sizeof(listenSocket_)) != 0) {
+        closesocket(client);
+        if (!stopping_ && !PostAccept(io)) {
+            Logger::Instance().Error("Failed to repost AcceptEx after updating accept context.");
+        }
+        return;
+    }
 
     if (onAccept_) {
         onAccept_(client);
@@ -106,7 +121,7 @@ void TcpAcceptor::HandleAccept(AcceptIo& io, DWORD error) {
         closesocket(client);
     }
 
-    if (!stopping_) {
-        PostAccept(io);
+    if (!stopping_ && !PostAccept(io)) {
+        Logger::Instance().Error("Failed to repost AcceptEx.");
     }
 }

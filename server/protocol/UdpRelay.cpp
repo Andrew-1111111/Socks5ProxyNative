@@ -5,7 +5,18 @@
 #include "../../network/Network.h"
 #include "../../utils/Logger.h"
 
+#include <WinSock2.h>
+
+#include <chrono>
+#include <cstdint>
 #include <cstring>
+#include <exception>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace {
 constexpr auto kCleanupInterval = std::chrono::seconds(10);
@@ -38,7 +49,7 @@ UdpRelay::UdpRelay(IocpService& iocp,
 
 UdpRelay::~UdpRelay() {
     Stop(false);
-    WaitPendingZero(3000);
+    WaitPendingZero(-1);
 }
 
 bool UdpRelay::BindRelaySocket() {
@@ -122,7 +133,7 @@ bool UdpRelay::Start() {
         }
     }
 
-    if (!iocp_.Associate(udpSocket_, this)) {
+    if (!iocp_.Associate(udpSocket_, shared_from_this())) {
         closesocket(udpSocket_);
         udpSocket_ = INVALID_SOCKET;
         return false;
@@ -139,6 +150,7 @@ bool UdpRelay::Start() {
 }
 
 void UdpRelay::Stop(bool notifySession) {
+    std::lock_guard completionLock(completionMutex_);
     if (stop_.exchange(true)) {
         return;
     }
@@ -149,10 +161,9 @@ void UdpRelay::Stop(bool notifySession) {
     {
         std::lock_guard lock(stateMutex_);
         pendingSends_.clear();
-        inFlightSends_.clear();
-        sendsInFlight_ = 0;
-        dnsNotifies_.clear();
         fragAssemblies_.clear();
+        pendingByDomain_.clear();
+        dnsInFlight_.clear();
     }
     if (notifySession && onStopped_) {
         auto cb = std::move(onStopped_);
@@ -163,7 +174,7 @@ void UdpRelay::Stop(bool notifySession) {
 
 bool UdpRelay::PostNextRecv() {
     if (stop_ || udpSocket_ == INVALID_SOCKET) return false;
-    return iocp_.PostRecvFrom(udpSocket_, &recvCtx_, this);
+    return iocp_.PostRecvFrom(udpSocket_, &recvCtx_, shared_from_this());
 }
 
 void UdpRelay::OnIoCompleted(DWORD bytes, DWORD error, IoContext* ctx) {
@@ -181,6 +192,11 @@ void UdpRelay::OnIoCompleted(DWORD bytes, DWORD error, IoContext* ctx) {
         if (!stop_ && notify) {
             OnDnsNotify(*notify);
         }
+        return;
+    }
+
+    if (ctx->op == IoOp::SendTo) {
+        OnSendCompleted(ctx);
         return;
     }
 
@@ -210,8 +226,6 @@ void UdpRelay::OnIoCompleted(DWORD bytes, DWORD error, IoContext* ctx) {
         PostNextRecv();
         return;
     }
-
-    OnSendCompleted(ctx);
 }
 
 void UdpRelay::OnSendCompleted(IoContext* ctx) {
@@ -260,6 +274,10 @@ void UdpRelay::EnqueueSend(std::vector<char> data, const sockaddr_storage& to) {
 }
 
 void UdpRelay::EnqueueSendLocked(std::vector<char> data, const sockaddr_storage& to) {
+    if (pendingSends_.size() >= kMaxPendingUdpSends) {
+        Logger::Instance().Warning("UDP send queue limit reached; dropping datagram.");
+        return;
+    }
     auto out = std::make_unique<Outbound>();
     out->data = std::move(data);
     out->to = to;
@@ -275,8 +293,10 @@ void UdpRelay::PumpSendLocked() {
         pendingSends_.pop_front();
         Outbound* raw = out.get();
         if (!iocp_.PostSendTo(udpSocket_, &raw->ctx, raw->data.data(), raw->data.size(),
-                              reinterpret_cast<sockaddr*>(&raw->to), raw->toLen, this)) {
-            continue;
+                              reinterpret_cast<sockaddr*>(&raw->to), raw->toLen, shared_from_this())) {
+            pendingSends_.push_front(std::move(out));
+            Logger::Instance().Warning("Failed to post UDP send; waiting for retry.");
+            break;
         }
         inFlightSends_.push_back(std::move(out));
         ++sendsInFlight_;
@@ -289,7 +309,12 @@ void UdpRelay::ForwardPayload(const uint8_t* payload, int payloadLen, const sock
                            reinterpret_cast<const char*>(payload) + payloadLen);
     {
         std::lock_guard lock(stateMutex_);
-        activeDestinations_[EndpointKey::From(destination)] = std::chrono::steady_clock::now();
+        const EndpointKey key = EndpointKey::From(destination);
+        if (!activeDestinations_.count(key) &&
+            activeDestinations_.size() >= kMaxActiveDestinations) {
+            activeDestinations_.erase(activeDestinations_.begin());
+        }
+        activeDestinations_[key] = std::chrono::steady_clock::now();
         EnqueueSendLocked(std::move(data), destination);
     }
 }
@@ -315,7 +340,16 @@ void UdpRelay::DispatchClientPayload(const sockaddr_storage* ipDestination,
     bool startResolve = false;
     {
         std::lock_guard lock(stateMutex_);
-        pendingByDomain_[*domain].push_back(std::move(pending));
+        auto& queue = pendingByDomain_[*domain];
+        if ((queue.empty() && pendingByDomain_.size() > kMaxPendingDomains) ||
+            queue.size() >= kMaxPacketsPerDomain) {
+            if (queue.empty()) {
+                pendingByDomain_.erase(*domain);
+            }
+            Logger::Instance().Warning("UDP DNS pending queue limit reached; dropping datagram.");
+            return;
+        }
+        queue.push_back(std::move(pending));
         if (dnsInFlight_.insert(*domain).second) {
             startResolve = true;
         }
@@ -334,9 +368,11 @@ void UdpRelay::DispatchClientPayload(const sockaddr_storage* ipDestination,
             std::lock_guard lock(self->stateMutex_);
             self->dnsNotifies_[ctx] = std::move(notify);
         }
-        if (!self->iocp_.PostUser(self.get(), ctx)) {
+        if (!self->iocp_.PostUser(self, ctx)) {
             std::lock_guard lock(self->stateMutex_);
             self->dnsNotifies_.erase(ctx);
+            self->dnsInFlight_.erase(domainCopy);
+            self->pendingByDomain_.erase(domainCopy);
         }
     });
 }
@@ -365,6 +401,11 @@ bool UdpRelay::ProcessFragment(uint8_t frag,
     const auto now = std::chrono::steady_clock::now();
 
     if (fragNum == 1) {
+        if (!fragAssemblies_.count(assemblyKey) &&
+            fragAssemblies_.size() >= kMaxFragmentAssemblies) {
+            Logger::Instance().Warning("UDP fragment assembly limit reached; dropping fragment.");
+            return false;
+        }
         FragAssembly assembly;
         assembly.updated = now;
         assembly.port = port;
@@ -382,7 +423,16 @@ bool UdpRelay::ProcessFragment(uint8_t frag,
 
     FragAssembly& assembly = fragAssemblies_[assemblyKey];
     assembly.updated = now;
+    const auto existing = assembly.parts.find(fragNum);
+    const size_t oldSize = existing == assembly.parts.end() ? 0 : existing->second.size();
+    const size_t newSize = static_cast<size_t>(payloadLen);
+    if (newSize > kMaxAssembledUdpPayload ||
+        assembly.totalBytes - oldSize > kMaxAssembledUdpPayload - newSize) {
+        fragAssemblies_.erase(assemblyKey);
+        return false;
+    }
     assembly.parts[fragNum].assign(payload, payload + payloadLen);
+    assembly.totalBytes = assembly.totalBytes - oldSize + newSize;
     if (isLast) {
         assembly.haveLast = true;
         assembly.lastFragNum = fragNum;

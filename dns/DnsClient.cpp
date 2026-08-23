@@ -3,9 +3,14 @@
 #include <chrono>
 #include <climits>
 #include <cctype>
+#include <cstdint>
+#include <mutex>
+#include <optional>
 #include <random>
 #include <sstream>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -62,6 +67,10 @@ std::optional<std::optional<std::string>> DnsClient::TryGetCached(const std::str
 }
 
 std::vector<uint8_t> DnsClient::BuildQuery(const std::string& domain, uint16_t id, uint16_t type) {
+    if (domain.empty() || domain.size() > 253) {
+        throw std::invalid_argument("Invalid domain length");
+    }
+
     std::vector<uint8_t> out;
     out.reserve(256);
     WriteU16(out, id);
@@ -81,6 +90,9 @@ std::vector<uint8_t> DnsClient::BuildQuery(const std::string& domain, uint16_t i
         out.insert(out.end(), label.begin(), label.end());
     }
     out.push_back(0);
+    if (out.size() - 12 > 255) {
+        throw std::invalid_argument("Encoded domain name is too long");
+    }
     WriteU16(out, type);
     WriteU16(out, 1);
 
@@ -100,6 +112,9 @@ DnsClient::DnsResult DnsClient::ParseResponse(const uint8_t* buffer, int length,
     if (ReadU16(buffer) != expectedId) return DnsResult::Invalid();
 
     const uint16_t flags = ReadU16(buffer + 2);
+    if ((flags & 0x8000) == 0 || (flags & 0x7800) != 0) {
+        return DnsResult::Invalid();
+    }
     const bool truncated = (flags & 0x0200) != 0;
     const int rcode = flags & 0xF;
     if (rcode != 0) {
@@ -110,6 +125,9 @@ DnsClient::DnsResult DnsClient::ParseResponse(const uint8_t* buffer, int length,
 
     const uint16_t qd = ReadU16(buffer + 4);
     const uint16_t an = ReadU16(buffer + 6);
+    if (qd > 64 || an > 64) {
+        return DnsResult::Invalid();
+    }
     int pos = 12;
 
     auto truncatedEmpty = [&]() {
@@ -120,6 +138,9 @@ DnsClient::DnsResult DnsClient::ParseResponse(const uint8_t* buffer, int length,
     try {
         for (int i = 0; i < qd; ++i) {
             pos = SkipName(buffer, length, pos) + 4;
+            if (pos > length) {
+                return truncated ? truncatedEmpty() : DnsResult::Invalid();
+            }
         }
 
         int minTtl = INT_MAX;
@@ -129,16 +150,18 @@ DnsClient::DnsResult DnsClient::ParseResponse(const uint8_t* buffer, int length,
                 return truncated ? truncatedEmpty() : DnsResult::Invalid();
             }
             const uint16_t type = ReadU16(buffer + pos); pos += 2;
-            pos += 2;
+            const uint16_t dnsClass = ReadU16(buffer + pos); pos += 2;
             const uint32_t ttl = ReadU32(buffer + pos); pos += 4;
             const uint16_t rdlen = ReadU16(buffer + pos); pos += 2;
-            if (static_cast<int>(ttl) < minTtl) minTtl = static_cast<int>(ttl);
+            const int ttlSeconds =
+                ttl > static_cast<uint32_t>(INT_MAX) ? INT_MAX : static_cast<int>(ttl);
+            if (ttlSeconds < minTtl) minTtl = ttlSeconds;
 
             if (pos + rdlen > length) {
                 return truncated ? truncatedEmpty() : DnsResult::Invalid();
             }
 
-            if (type == expectedType) {
+            if (dnsClass == 1 && type == expectedType) {
                 if (type == 1 && rdlen == 4) {
                     char ip[INET_ADDRSTRLEN]{};
                     inet_ntop(AF_INET, buffer + pos, ip, sizeof(ip));
@@ -166,6 +189,8 @@ int DnsClient::SkipName(const uint8_t* buffer, int length, int pos) {
         if (len == 0) return pos + 1;
         if ((len & 0xC0) == 0xC0) {
             if (pos + 1 >= length) throw std::runtime_error("Invalid DNS compression");
+            const int pointer = ((len & 0x3F) << 8) | buffer[pos + 1];
+            if (pointer >= length) throw std::runtime_error("Invalid DNS compression offset");
             if (++jumps > 20) throw std::runtime_error("Compression loop");
             return pos + 2;
         }

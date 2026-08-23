@@ -2,7 +2,15 @@
 
 #include "../../utils/Logger.h"
 
+#include <Windows.h>
+#include <sspi.h>
+
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
+#include <limits>
+#include <string>
+#include <vector>
 
 #pragma comment(lib, "secur32.lib")
 
@@ -70,6 +78,9 @@ bool GssapiContext::AcquireDefaultCredentials() {
 GssapiContext::AcceptStatus GssapiContext::AcceptToken(const uint8_t* input, size_t inputLen,
                                                        std::vector<uint8_t>& outputToken) {
     outputToken.clear();
+    if (inputLen > static_cast<size_t>(std::numeric_limits<ULONG>::max())) {
+        return AcceptStatus::Failed;
+    }
     if (!haveCredentials_ && !AcquireDefaultCredentials()) {
         return AcceptStatus::Failed;
     }
@@ -102,7 +113,7 @@ GssapiContext::AcceptStatus GssapiContext::AcceptToken(const uint8_t* input, siz
         ASC_REQ_CONFIDENTIALITY | ASC_REQ_INTEGRITY;
 
     CtxtHandle* ctxPtr = haveContext_ ? &context_ : nullptr;
-    const SECURITY_STATUS st = AcceptSecurityContext(
+    SECURITY_STATUS st = AcceptSecurityContext(
         &credentials_,
         ctxPtr,
         (input && inputLen > 0) ? &inDesc : nullptr,
@@ -112,6 +123,26 @@ GssapiContext::AcceptStatus GssapiContext::AcceptToken(const uint8_t* input, siz
         &outDesc,
         &contextAttr,
         &lifetime);
+
+    if (st == SEC_I_COMPLETE_NEEDED || st == SEC_I_COMPLETE_AND_CONTINUE) {
+        const SECURITY_STATUS completeStatus = CompleteAuthToken(&context_, &outDesc);
+        if (completeStatus != SEC_E_OK) {
+            Logger::Instance().Warning("GSSAPI: CompleteAuthToken failed: {Status}",
+                                       static_cast<int>(completeStatus));
+            haveContext_ = SecIsValidHandle(&context_) != FALSE;
+            Reset();
+            return AcceptStatus::Failed;
+        }
+        st = st == SEC_I_COMPLETE_NEEDED ? SEC_E_OK : SEC_I_CONTINUE_NEEDED;
+    }
+
+    if (st != SEC_E_OK && st != SEC_I_CONTINUE_NEEDED) {
+        Logger::Instance().Warning("GSSAPI: AcceptSecurityContext failed: {Status}",
+                                   static_cast<int>(st));
+        haveContext_ = SecIsValidHandle(&context_) != FALSE;
+        Reset();
+        return AcceptStatus::Failed;
+    }
 
     haveContext_ = true;
     contextAttrs_ = contextAttr;
@@ -127,32 +158,44 @@ GssapiContext::AcceptStatus GssapiContext::AcceptToken(const uint8_t* input, siz
         if (QueryContextAttributesW(&context_, SECPKG_ATTR_NAMES, &names) == SEC_E_OK && names.sUserName) {
             const int bytes = WideCharToMultiByte(CP_UTF8, 0, names.sUserName, -1, nullptr, 0, nullptr, nullptr);
             if (bytes > 1) {
-                clientName_.resize(static_cast<size_t>(bytes - 1));
-                WideCharToMultiByte(CP_UTF8, 0, names.sUserName, -1, clientName_.data(), bytes, nullptr, nullptr);
+                clientName_.resize(static_cast<size_t>(bytes));
+                if (WideCharToMultiByte(CP_UTF8, 0, names.sUserName, -1,
+                                        clientName_.data(), bytes, nullptr, nullptr) > 0) {
+                    clientName_.pop_back();
+                } else {
+                    clientName_.clear();
+                }
             }
             FreeContextBuffer(names.sUserName);
         }
         return AcceptStatus::Complete;
     }
-    if (st == SEC_I_CONTINUE_NEEDED || st == SEC_I_COMPLETE_AND_CONTINUE) {
+    if (st == SEC_I_CONTINUE_NEEDED) {
         return AcceptStatus::ContinueNeeded;
     }
 
-    Logger::Instance().Warning("GSSAPI: AcceptSecurityContext failed: {Status}", static_cast<int>(st));
     return AcceptStatus::Failed;
 }
 
 bool GssapiContext::Wrap(const uint8_t* input, size_t inputLen, bool confidentiality,
                          std::vector<uint8_t>& output) {
     output.clear();
-    if (!haveContext_ || !complete_ || !input) return false;
+    if (!haveContext_ || !complete_ || !input ||
+        inputLen > static_cast<size_t>(std::numeric_limits<ULONG>::max())) {
+        return false;
+    }
 
     SecPkgContext_Sizes sizes{};
     if (QueryContextAttributesW(&context_, SECPKG_ATTR_SIZES, &sizes) != SEC_E_OK) {
         return false;
     }
 
-    const size_t total = static_cast<size_t>(sizes.cbSecurityTrailer) + inputLen + sizes.cbBlockSize;
+    const size_t overhead =
+        static_cast<size_t>(sizes.cbSecurityTrailer) + static_cast<size_t>(sizes.cbBlockSize);
+    if (inputLen > std::numeric_limits<size_t>::max() - overhead) {
+        return false;
+    }
+    const size_t total = overhead + inputLen;
     std::vector<uint8_t> buffer(total);
     std::memcpy(buffer.data() + sizes.cbSecurityTrailer, input, inputLen);
 
@@ -189,7 +232,10 @@ bool GssapiContext::Wrap(const uint8_t* input, size_t inputLen, bool confidentia
 
 bool GssapiContext::Unwrap(const uint8_t* input, size_t inputLen, std::vector<uint8_t>& output) {
     output.clear();
-    if (!haveContext_ || !complete_ || !input || inputLen == 0) return false;
+    if (!haveContext_ || !complete_ || !input || inputLen == 0 ||
+        inputLen > static_cast<size_t>(std::numeric_limits<ULONG>::max())) {
+        return false;
+    }
 
     std::vector<uint8_t> buffer(input, input + inputLen);
     SecBuffer bufs[2]{};

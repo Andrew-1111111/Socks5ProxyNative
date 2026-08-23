@@ -6,8 +6,9 @@
 #include <ws2tcpip.h>
 
 #include <cstring>
+#include <string>
 
-std::string NetworkConfiguration::ListenIPAddress = "0.0.0.0";
+std::string NetworkConfiguration::ListenIPAddress = "127.0.0.1";
 uint16_t NetworkConfiguration::ListenPort = 1080;
 bool NetworkConfiguration::OutputIPv6Available = false;
 std::string NetworkConfiguration::OutputInterfaceIP = "0.0.0.0";
@@ -137,8 +138,8 @@ bool NetworkConfiguration::SetDnsIP(const std::string& ip, std::string& errorMes
 
 bool NetworkConfiguration::SetMaxConnections(int connections, std::string& errorMessage) {
     errorMessage.clear();
-    if (connections < 0) {
-        errorMessage = "The number of connections must be greater than or equal to zero.";
+    if (connections < 0 || connections > 1048576) {
+        errorMessage = "The number of connections must be in the range 0-1048576.";
         return false;
     }
     MaxConnections = connections;
@@ -187,64 +188,85 @@ bool NetworkConfiguration::SetSocketOptions(int idleTimeoutMs, int connectTimeou
         }
         return true;
     };
+    auto requireMax = [&](int v, int maximum, const char* name) {
+        if (v > maximum) {
+            errorMessage = std::string(name) + " exceeds the supported maximum.";
+            return false;
+        }
+        return true;
+    };
 
     if (idleTimeoutMs >= 0) {
-        if (!requireNonNeg(idleTimeoutMs, "IdleTimeoutMs")) return false;
+        if (!requireNonNeg(idleTimeoutMs, "IdleTimeoutMs") ||
+            !requireMax(idleTimeoutMs, 86'400'000, "IdleTimeoutMs")) return false;
         IdleTimeoutMs = idleTimeoutMs;
     }
     if (connectTimeoutMs >= 0) {
-        if (!requirePos(connectTimeoutMs, "ConnectTimeoutMs")) return false;
+        if (!requirePos(connectTimeoutMs, "ConnectTimeoutMs") ||
+            !requireMax(connectTimeoutMs, 86'400'000, "ConnectTimeoutMs")) return false;
         ConnectTimeoutMs = connectTimeoutMs;
     }
     if (sendTimeoutMs >= 0) {
-        if (!requireNonNeg(sendTimeoutMs, "SendTimeoutMs")) return false;
+        if (!requireNonNeg(sendTimeoutMs, "SendTimeoutMs") ||
+            !requireMax(sendTimeoutMs, 86'400'000, "SendTimeoutMs")) return false;
         SendTimeoutMs = sendTimeoutMs;
     }
     if (receiveTimeoutMs >= 0) {
-        if (!requireNonNeg(receiveTimeoutMs, "ReceiveTimeoutMs")) return false;
+        if (!requireNonNeg(receiveTimeoutMs, "ReceiveTimeoutMs") ||
+            !requireMax(receiveTimeoutMs, 86'400'000, "ReceiveTimeoutMs")) return false;
         ReceiveTimeoutMs = receiveTimeoutMs;
     }
     if (dnsSendTimeoutMs >= 0) {
-        if (!requirePos(dnsSendTimeoutMs, "DnsSendTimeoutMs")) return false;
+        if (!requirePos(dnsSendTimeoutMs, "DnsSendTimeoutMs") ||
+            !requireMax(dnsSendTimeoutMs, 86'400'000, "DnsSendTimeoutMs")) return false;
         DnsSendTimeoutMs = dnsSendTimeoutMs;
     }
     if (dnsReceiveTimeoutMs >= 0) {
-        if (!requirePos(dnsReceiveTimeoutMs, "DnsReceiveTimeoutMs")) return false;
+        if (!requirePos(dnsReceiveTimeoutMs, "DnsReceiveTimeoutMs") ||
+            !requireMax(dnsReceiveTimeoutMs, 86'400'000, "DnsReceiveTimeoutMs")) return false;
         DnsReceiveTimeoutMs = dnsReceiveTimeoutMs;
     }
     if (udpAssociateIdleTimeoutMs >= 0) {
-        if (!requirePos(udpAssociateIdleTimeoutMs, "UdpAssociateIdleTimeoutMs")) return false;
+        if (!requirePos(udpAssociateIdleTimeoutMs, "UdpAssociateIdleTimeoutMs") ||
+            !requireMax(udpAssociateIdleTimeoutMs, 86'400'000, "UdpAssociateIdleTimeoutMs")) return false;
         UdpAssociateIdleTimeoutMs = udpAssociateIdleTimeoutMs;
     }
     if (sendBufferSize >= 0) {
-        if (!requirePos(sendBufferSize, "SendBufferSize")) return false;
+        if (!requirePos(sendBufferSize, "SendBufferSize") ||
+            !requireMax(sendBufferSize, 16 * 1024 * 1024, "SendBufferSize")) return false;
         SendBufferSize = sendBufferSize;
     }
     if (receiveBufferSize >= 0) {
-        if (!requirePos(receiveBufferSize, "ReceiveBufferSize")) return false;
+        if (!requirePos(receiveBufferSize, "ReceiveBufferSize") ||
+            !requireMax(receiveBufferSize, 16 * 1024 * 1024, "ReceiveBufferSize")) return false;
         ReceiveBufferSize = receiveBufferSize;
     }
     if (bufferSize >= 0) {
-        if (!requirePos(bufferSize, "BufferSize")) return false;
+        if (!requirePos(bufferSize, "BufferSize") ||
+            !requireMax(bufferSize, 16 * 1024 * 1024, "BufferSize")) return false;
         BufferSize = bufferSize;
     }
     if (noDelay >= 0) NoDelay = noDelay != 0;
     if (keepAlive >= 0) KeepAlive = keepAlive != 0;
     if (lingerEnabled >= 0) LingerEnabled = lingerEnabled != 0;
     if (lingerTimeoutSec >= 0) {
-        if (!requireNonNeg(lingerTimeoutSec, "LingerTimeoutSec")) return false;
+        if (!requireNonNeg(lingerTimeoutSec, "LingerTimeoutSec") ||
+            !requireMax(lingerTimeoutSec, 65535, "LingerTimeoutSec")) return false;
         LingerTimeoutSec = lingerTimeoutSec;
     }
     if (tcpKeepAliveTime >= 0) {
-        if (!requirePos(tcpKeepAliveTime, "TcpKeepAliveTime")) return false;
+        if (!requirePos(tcpKeepAliveTime, "TcpKeepAliveTime") ||
+            !requireMax(tcpKeepAliveTime, 4'294'967, "TcpKeepAliveTime")) return false;
         TcpKeepAliveTime = tcpKeepAliveTime;
     }
     if (tcpKeepAliveInterval >= 0) {
-        if (!requirePos(tcpKeepAliveInterval, "TcpKeepAliveInterval")) return false;
+        if (!requirePos(tcpKeepAliveInterval, "TcpKeepAliveInterval") ||
+            !requireMax(tcpKeepAliveInterval, 4'294'967, "TcpKeepAliveInterval")) return false;
         TcpKeepAliveInterval = tcpKeepAliveInterval;
     }
     if (tcpKeepAliveRetryCount >= 0) {
-        if (!requirePos(tcpKeepAliveRetryCount, "TcpKeepAliveRetryCount")) return false;
+        if (!requirePos(tcpKeepAliveRetryCount, "TcpKeepAliveRetryCount") ||
+            !requireMax(tcpKeepAliveRetryCount, 255, "TcpKeepAliveRetryCount")) return false;
         TcpKeepAliveRetryCount = tcpKeepAliveRetryCount;
     }
     return true;

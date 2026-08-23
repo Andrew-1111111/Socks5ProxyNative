@@ -1,23 +1,25 @@
 ﻿#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
-#include <windows.h>
 #include <winsock2.h>
+#include <windows.h>
 
 #include "config/NetworkConfiguration.h"
 #include "config/ProxyConfiguration.h"
 #include "friendly/FriendlyNameResolver.h"
 #include "helper/NetworkMonitoring.h"
+#include "network/Network.h"
 #include "server/ProxyServer.h"
 #include "utils/Application.h"
 #include "utils/Logger.h"
 
 #include <atomic>
+#include <chrono>
+#include <exception>
 #include <filesystem>
 #include <iostream>
 #include <string>
 #include <thread>
-#include <exception>
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -44,6 +46,14 @@ std::string GetExeDir() {
     return std::filesystem::path(GetExePath()).parent_path().string();
 }
 
+void PauseOnErrorIfStandaloneConsole() {
+    DWORD processIds[2]{};
+    if (GetConsoleProcessList(processIds, 2) == 1) {
+        std::cout << "\nPress Enter to exit...";
+        std::cin.get();
+    }
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -54,14 +64,8 @@ int main(int argc, char* argv[]) {
     }
 
     int exitCode = 0;
+    bool restartAfterCleanup = false;
     try {
-        SingleInstanceGuard guard(L"Socks5Proxy_12345");
-        if (guard.IsRunning()) {
-            std::cout << "Another " << GetExePath() << " instance is already running." << std::endl;
-            WSACleanup();
-            return 1;
-        }
-
         Logger::Instance().Info("SOCKS5 Proxy Server starting...");
 
         std::string configPath = "proxy.json";
@@ -87,18 +91,25 @@ int main(int argc, char* argv[]) {
         std::string error;
         if (!ProxyConfiguration::LoadFromFile(configPath, proxyConfig, error)) {
             Logger::Instance().Error(error);
-            std::cout << "\nPress any key for exit...";
-            std::cin.get();
+            PauseOnErrorIfStandaloneConsole();
             WSACleanup();
             return 4;
         }
 
         if (!proxyConfig.IsValid(error)) {
             Logger::Instance().Error("Invalid proxy configuration: {Error}", error);
-            std::cout << "\nPress any key for exit...";
-            std::cin.get();
+            PauseOnErrorIfStandaloneConsole();
             WSACleanup();
             return 2;
+        }
+        if (!NetworkConfiguration::HasCredentials() &&
+            !NetworkConfiguration::EnableGssapi &&
+            NetworkUtils::IsAnyAddress(NetworkConfiguration::ListenIPAddress)) {
+            Logger::Instance().Info(
+                "Proxy is listening on all interfaces without authentication.");
+        }
+        if (proxyConfig.RunDelayS > 0) {
+            std::this_thread::sleep_for(std::chrono::seconds(proxyConfig.RunDelayS));
         }
 
         Logger::Instance().Info("Proxy configuration loaded successfully");
@@ -107,6 +118,13 @@ int main(int argc, char* argv[]) {
             Logger::Instance().Error("Application requires administrator/root privileges to run.");
             WSACleanup();
             return 3;
+        }
+
+        SingleInstanceGuard guard(L"Socks5Proxy_12345");
+        if (guard.IsRunning()) {
+            std::cout << "Another " << GetExePath() << " instance is already running." << std::endl;
+            WSACleanup();
+            return 1;
         }
 
         const std::string exePath = GetExePath();
@@ -121,12 +139,6 @@ int main(int argc, char* argv[]) {
         SetConsoleCtrlHandler(ConsoleHandler, TRUE);
 
         NetworkMonitoring monitoring;
-        std::thread monitorThread([&] {
-            monitoring.Run(NetworkConfiguration::ListenIPAddress,
-                           NetworkConfiguration::OutputInterfaceIP,
-                           g_stop);
-        });
-
         Logger::Instance().Info("Network monitoring: runned.");
         Logger::Instance().Info("Listen IP address: {Address}", NetworkConfiguration::ListenIPAddress);
         Logger::Instance().Info("Listen port: {Port}", NetworkConfiguration::ListenPort);
@@ -137,22 +149,44 @@ int main(int argc, char* argv[]) {
                                 NetworkConfiguration::ListenPort);
 
         ProxyServer server(resolver);
-        server.Start(g_stop);
+        std::thread monitorThread([&] {
+            monitoring.Run(NetworkConfiguration::ListenIPAddress,
+                           NetworkConfiguration::OutputInterfaceIP,
+                           g_stop);
+        });
+        try {
+            server.Start(g_stop);
+        } catch (...) {
+            g_stop = true;
+            if (monitorThread.joinable()) {
+                monitorThread.join();
+            }
+            throw;
+        }
 
         g_stop = true;
         if (monitorThread.joinable()) {
             monitorThread.join();
         }
+        restartAfterCleanup = monitoring.RestartRequested();
 
         Logger::Instance().Info("SOCKS5 proxy server stopped gracefully.");
         exitCode = 0;
     } catch (const std::exception& ex) {
         Logger::Instance().Error("Fatal error occurred: {Error}", ex.what());
         exitCode = 5;
+    } catch (...) {
+        Logger::Instance().Error("Fatal non-standard exception occurred.");
+        exitCode = 5;
     }
 
-    std::cout << "\nPress any key for exit...";
-    std::cin.get();
+    SetConsoleCtrlHandler(ConsoleHandler, FALSE);
     WSACleanup();
+    if (restartAfterCleanup) {
+        AdminLauncher::RestartApplication();
+    }
+    if (exitCode != 0) {
+        PauseOnErrorIfStandaloneConsole();
+    }
     return exitCode;
 }

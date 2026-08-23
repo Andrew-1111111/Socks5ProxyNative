@@ -9,7 +9,10 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <mutex>
 #include <string>
+#include <string_view>
+#include <vector>
 
 namespace {
 
@@ -206,6 +209,24 @@ void Logger::LogTemplate(LogLevel level, std::string_view tmpl, std::vector<LogV
     std::lock_guard lock(mutex_);
     if (static_cast<int>(level) < static_cast<int>(minLevel_)) {
         return;
+    }
+
+    if (!tmpl.empty() && tmpl.back() == '.') {
+        while (!tmpl.empty() && tmpl.back() == '.') {
+            tmpl.remove_suffix(1);
+        }
+    } else {
+        const std::string rendered = RenderPlain(tmpl, values);
+        if (!rendered.empty() && rendered.back() == '.') {
+            for (auto it = values.rbegin(); it != values.rend(); ++it) {
+                if (!it->text.empty() && it->text.back() == '.') {
+                    while (!it->text.empty() && it->text.back() == '.') {
+                        it->text.pop_back();
+                    }
+                    break;
+                }
+            }
+        }
     }
 
     char timeBuf[16]{};

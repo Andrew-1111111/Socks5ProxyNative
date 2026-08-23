@@ -7,6 +7,7 @@
 #include "../../network/Iocp.h"
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <memory>
@@ -95,12 +96,13 @@ private:
     void SendGssFrame(uint8_t mtyp, const uint8_t* token, size_t tokenLen);
     void SendGssAbort();
     bool WrapAndQueueClient(const std::vector<char>& cleartext);
+    bool ProcessGssRelayInput();
     /// When GSS protection is active, unwrap one encapsulated SOCKS PDU into ingest_.
     bool EnsureCleartextRequestIngest();
 
     void ArmIdleTimer();
     void CancelIdleTimer();
-    void ArmConnectTimer();
+    bool ArmConnectTimer();
     void CancelConnectTimer();
     void RequestCloseAfterFlush();
     void FailAndClose(uint8_t replyCode);
@@ -127,6 +129,8 @@ private:
 
     IocpService::TimerId connectTimerId_ = 0;
     IocpService::TimerId idleTimerId_ = 0;
+    uint64_t connectTimerGeneration_ = 0;
+    uint64_t idleTimerGeneration_ = 0;
 
     std::string pendingHost_;
     uint16_t pendingPort_ = 0;

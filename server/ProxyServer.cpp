@@ -5,7 +5,18 @@
 #include "../network/Network.h"
 #include "../utils/Logger.h"
 
+#include <WinSock2.h>
+#include <Windows.h>
+
+#include <atomic>
 #include <chrono>
+#include <exception>
+#include <memory>
+#include <mutex>
+#include <semaphore>
+#include <stdexcept>
+#include <thread>
+#include <vector>
 
 ProxyServer::ProxyServer(FriendlyNameResolver& resolver)
     : resolver_(resolver) {}
@@ -140,6 +151,10 @@ void ProxyServer::Stop() {
         closesocket(listenSocket_);
         listenSocket_ = INVALID_SOCKET;
     }
+    if (acceptor_) {
+        acceptor_->WaitPendingZero(-1);
+        acceptor_.reset();
+    }
 
     std::vector<std::shared_ptr<Socks5Session>> snapshot;
     {
@@ -150,6 +165,9 @@ void ProxyServer::Stop() {
                             static_cast<int>(snapshot.size()));
     for (auto& s : snapshot) {
         s->Close();
+    }
+    for (auto& s : snapshot) {
+        s->WaitPendingZero(-1);
     }
 
     {
@@ -173,13 +191,9 @@ void ProxyServer::Stop() {
         }
     }
 
-    if (acceptor_) {
-        acceptor_->WaitPendingZero(3000);
-        acceptor_.reset();
-    }
     if (dns_) {
         dns_->Stop();
-        dns_->WaitPendingZero(5000);
+        dns_->WaitPendingZero(-1);
         dns_.reset();
     }
     iocp_.Stop();

@@ -16,7 +16,6 @@ public:
 private:
     bool TryAcquire();
     void ReleaseHandle();
-    static void CloseOtherSocks5Processes();
 
     std::wstring mutexName_;
     void* mutex_ = nullptr;

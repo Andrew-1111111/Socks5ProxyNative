@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -55,6 +56,7 @@ private:
         std::map<uint8_t, std::vector<uint8_t>> parts;
         bool haveLast = false;
         uint8_t lastFragNum = 0;
+        size_t totalBytes = 0;
         std::chrono::steady_clock::time_point updated{};
     };
 
@@ -103,6 +105,11 @@ private:
     bool BindRelaySocket();
 
     static constexpr size_t kMaxUdpSendsInFlight = 16;
+    static constexpr size_t kMaxPendingUdpSends = 1024;
+    static constexpr size_t kMaxPendingDomains = 256;
+    static constexpr size_t kMaxPacketsPerDomain = 64;
+    static constexpr size_t kMaxFragmentAssemblies = 256;
+    static constexpr size_t kMaxActiveDestinations = 4096;
 
     IocpService& iocp_;
     DnsResolver& dns_;

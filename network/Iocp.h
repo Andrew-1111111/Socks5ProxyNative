@@ -3,15 +3,22 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <mswsock.h>
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <WinSock2.h>
+#include <Windows.h>
+#include <ws2ipdef.h>
+#include <MSWSock.h>
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -25,6 +32,29 @@ enum class IoOp : uint8_t {
     Accept,
     User
 };
+struct IoContext;
+
+// IOCP completion target. Must be owned by std::shared_ptr while I/O is outstanding.
+class IocpHandle : public std::enable_shared_from_this<IocpHandle> {
+public:
+    virtual ~IocpHandle() = default;
+    virtual void OnIoCompleted(DWORD bytes, DWORD error, IoContext* ctx) = 0;
+
+    void AddPending() { pending_.fetch_add(1, std::memory_order_acq_rel); }
+    void ReleasePending() { pending_.fetch_sub(1, std::memory_order_acq_rel); }
+    int Pending() const { return pending_.load(std::memory_order_acquire); }
+    /// Wait until outstanding IOCP ops complete (after cancel/close).
+    bool WaitPendingZero(int timeoutMs = 5000) const;
+
+protected:
+    // IOCP may dispatch different contexts for one handle on different workers.
+    // Recursive because completion handlers can call Close()/Stop().
+    mutable std::recursive_mutex completionMutex_;
+
+private:
+    friend class IocpService;
+    std::atomic<int> pending_{0};
+};
 
 struct IoContext : OVERLAPPED {
     IoOp op = IoOp::Recv;
@@ -37,26 +67,13 @@ struct IoContext : OVERLAPPED {
     size_t sendOffset = 0;
     size_t sendLength = 0;
     uint64_t userKey = 0;
+    /// Set for heap IoContext objects allocated by ScheduleTimeout.
+    bool iocpOwned = false;
+    /// Pins IocpHandle lifetime until this I/O completes.
+    std::shared_ptr<IocpHandle> handlePin;
 
     explicit IoContext(IoOp operation = IoOp::Recv, size_t bufSize = 0);
     void Reset(IoOp operation);
-};
-
-// Object associated with IOCP via completion key (raw this pointer).
-// Lifetime must outlive all outstanding I/O (use shared_ptr + pending counter).
-class IocpHandle : public std::enable_shared_from_this<IocpHandle> {
-public:
-    virtual ~IocpHandle() = default;
-    virtual void OnIoCompleted(DWORD bytes, DWORD error, IoContext* ctx) = 0;
-
-    void AddPending() { ++pending_; }
-    void ReleasePending() { --pending_; }
-    int Pending() const { return pending_.load(); }
-    /// Wait until outstanding IOCP ops complete (after cancel/close).
-    bool WaitPendingZero(int timeoutMs = 5000) const;
-
-private:
-    std::atomic<int> pending_{0};
 };
 
 class IocpService {
@@ -72,26 +89,30 @@ public:
     bool Start();
     void Stop();
 
-    bool Associate(SOCKET socket, IocpHandle* handle);
+    bool Associate(SOCKET socket, const std::shared_ptr<IocpHandle>& handle);
 
-    bool PostRecv(SOCKET socket, IoContext* ctx, IocpHandle* handle);
-    bool PostSend(SOCKET socket, IoContext* ctx, size_t offset, size_t length, IocpHandle* handle);
+    bool PostRecv(SOCKET socket, IoContext* ctx, const std::shared_ptr<IocpHandle>& handle,
+                  size_t offset = 0, size_t length = 0);
+    bool PostSend(SOCKET socket, IoContext* ctx, size_t offset, size_t length,
+                  const std::shared_ptr<IocpHandle>& handle);
     /// Send from caller-owned buffer (must stay valid until completion).
     bool PostSend(SOCKET socket, IoContext* ctx, char* data, size_t offset, size_t length,
-                  IocpHandle* handle);
-    bool PostRecvFrom(SOCKET socket, IoContext* ctx, IocpHandle* handle);
+                  const std::shared_ptr<IocpHandle>& handle);
+    bool PostRecvFrom(SOCKET socket, IoContext* ctx, const std::shared_ptr<IocpHandle>& handle);
     bool PostSendTo(SOCKET socket, IoContext* ctx, size_t length,
-                    const sockaddr* to, int toLen, IocpHandle* handle);
+                    const sockaddr* to, int toLen, const std::shared_ptr<IocpHandle>& handle);
     /// SendTo from caller-owned buffer (must stay valid until completion).
     bool PostSendTo(SOCKET socket, IoContext* ctx, char* data, size_t length,
-                    const sockaddr* to, int toLen, IocpHandle* handle);
-    bool PostConnect(SOCKET socket, IoContext* ctx, const sockaddr* name, int namelen, IocpHandle* handle);
+                    const sockaddr* to, int toLen, const std::shared_ptr<IocpHandle>& handle);
+    bool PostConnect(SOCKET socket, IoContext* ctx, const sockaddr* name, int namelen,
+                     const std::shared_ptr<IocpHandle>& handle);
     bool PostAccept(SOCKET listenSocket, SOCKET acceptSocket, IoContext* ctx,
-                    char* addrBuf, DWORD addrBufLen, IocpHandle* handle, LPFN_ACCEPTEX acceptEx);
-    bool PostUser(IocpHandle* handle, IoContext* ctx, uint64_t userKey = 0);
+                    char* addrBuf, DWORD addrBufLen, const std::shared_ptr<IocpHandle>& handle,
+                    LPFN_ACCEPTEX acceptEx);
+    bool PostUser(const std::shared_ptr<IocpHandle>& handle, IoContext* ctx, uint64_t userKey = 0);
 
     /// Schedule a User completion after delayMs (driven by GQCS wait, no threadpool).
-    TimerId ScheduleTimeout(IocpHandle* handle, uint64_t userKey, int delayMs);
+    TimerId ScheduleTimeout(const std::shared_ptr<IocpHandle>& handle, uint64_t userKey, int delayMs);
     void CancelTimeout(TimerId id);
 
     static SOCKET CreateTcpSocket(int family);
@@ -100,29 +121,57 @@ public:
     static bool LoadConnectEx(SOCKET socket, LPFN_CONNECTEX* outFn);
     static bool LoadAcceptEx(SOCKET socket, LPFN_ACCEPTEX* outFn);
 
-    bool IsRunning() const { return running_.load(); }
+    bool IsRunning() const { return running_.load(std::memory_order_acquire); }
 
 private:
-    struct TimerEntry {
+    enum class TimerPhase : uint8_t { Pending, Claimed, Cancelled };
+
+    struct TimerState {
         TimerId id = 0;
         std::chrono::steady_clock::time_point due{};
-        IocpHandle* handle = nullptr;
-        IoContext* ctx = nullptr;
+        std::shared_ptr<IocpHandle> handle;
+        std::unique_ptr<IoContext> ctx;
+        TimerPhase phase = TimerPhase::Pending;
     };
 
     void WorkerLoop();
     DWORD AdvanceTimers();
     void ClearTimers();
 
-    static LPFN_CONNECTEX connectEx_;
-    static std::once_flag connectExInit_;
+    static bool EnsureConnectEx(SOCKET socketHint = INVALID_SOCKET);
+
+    /// RAII: pins IOCP handle for worker IO until destroyed.
+    class IocpLease {
+    public:
+        explicit IocpLease(IocpService& svc);
+        ~IocpLease();
+        IocpLease(const IocpLease&) = delete;
+        IocpLease& operator=(const IocpLease&) = delete;
+        explicit operator bool() const { return handle_ != nullptr; }
+        HANDLE get() const { return handle_; }
+
+    private:
+        IocpService& svc_;
+        HANDLE handle_{nullptr};
+    };
+
+    void WaitIocpIdle() const;
+
+    void PinIocpHandle();
+    void UnpinIocpHandle();
+    bool PostIocpCompletion(HANDLE iocp, DWORD bytes, ULONG_PTR key, OVERLAPPED* overlapped);
 
     HANDLE iocp_ = nullptr;
+    std::atomic<int> iocpUsers_{0};
     std::atomic<bool> running_{false};
+    std::atomic<bool> stopping_{false};
+    mutable std::mutex iocpIdleMutex_;
+    mutable std::condition_variable iocpIdleCv_;
     unsigned workerCount_ = 4;
     std::vector<std::thread> workers_;
 
+    std::shared_mutex lifecycleMutex_;
     std::mutex timerMutex_;
-    std::unordered_map<TimerId, TimerEntry> timers_;
+    std::unordered_map<TimerId, std::shared_ptr<TimerState>> timers_;
     std::atomic<TimerId> nextTimerId_{1};
 };

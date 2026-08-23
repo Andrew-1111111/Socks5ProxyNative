@@ -4,6 +4,7 @@
 #include "../network/Iocp.h"
 
 #include <atomic>
+#include <cstddef>
 #include <deque>
 #include <functional>
 #include <list>
@@ -61,6 +62,9 @@ private:
     static constexpr uint64_t kTimeoutKey = 1;
     static constexpr int kMaxUdpAttempts = 3;
     static constexpr size_t kMaxDnsSendsInFlight = 16;
+    static constexpr size_t kMaxPendingSends = 4096;
+    static constexpr size_t kMaxPendingQueries = 4096;
+    static constexpr size_t kMaxCallbacksPerQuery = 256;
 
     uint16_t AllocTxidLocked();
     void BeginUdpQueryLocked(std::shared_ptr<PendingQuery> pending);
@@ -68,7 +72,7 @@ private:
     void EnqueueUdpSendLocked(std::vector<uint8_t> query);
     void PumpSendLocked();
     void OnUdpSendCompleted(IoContext* ctx);
-    void ArmTimerLocked(PendingQuery& pending);
+    bool ArmTimerLocked(PendingQuery& pending);
     void CancelTimerLocked(PendingQuery& pending);
     void HandleUdpResponse(const uint8_t* data, int length, const sockaddr_storage& from);
     void OnQueryResult(uint16_t txid, const DnsClient::DnsResult& result, bool fromTcp, bool isTimeout = false);

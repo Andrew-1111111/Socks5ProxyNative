@@ -1,7 +1,6 @@
 #include "NetworkMonitoring.h"
 
 #include "../network/Network.h"
-#include "../utils/Application.h"
 #include "../utils/Logger.h"
 
 #include <chrono>
@@ -43,7 +42,9 @@ void NetworkMonitoring::Run(const std::string& listenerAddress, const std::strin
         if (allSuccess >= 2) {
             currentNetworkCheck_ = 0;
         } else if (currentNetworkCheck_ >= MaxNetworkCheckRetry) {
-            AdminLauncher::RestartApplication();
+            restartRequested_.store(true, std::memory_order_release);
+            stopFlag.store(true, std::memory_order_release);
+            return;
         }
 
         for (int i = 0; i < 50 && !stopFlag; ++i) {

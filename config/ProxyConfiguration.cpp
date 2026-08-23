@@ -2,10 +2,12 @@
 #include "NetworkConfiguration.h"
 
 #include <cctype>
-#include <chrono>
+#include <exception>
 #include <fstream>
 #include <sstream>
-#include <thread>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace {
 
@@ -62,6 +64,7 @@ bool ExtractString(const std::string& json, const std::string& key, std::string&
         if (json[pos] == '"') break;
         raw.push_back(json[pos++]);
     }
+    if (pos >= json.size() || json[pos] != '"') return false;
     value = UnescapeJsonString(raw);
     return true;
 }
@@ -81,7 +84,11 @@ bool ExtractInt(const std::string& json, const std::string& key, int& value) {
     if (json[end] == '-') ++end;
     while (end < json.size() && std::isdigit(static_cast<unsigned char>(json[end]))) ++end;
     if (end == pos || (end == pos + 1 && json[pos] == '-')) return false;
-    value = std::stoi(json.substr(pos, end - pos));
+    try {
+        value = std::stoi(json.substr(pos, end - pos));
+    } catch (const std::exception&) {
+        return false;
+    }
     return true;
 }
 
@@ -194,35 +201,63 @@ bool ProxyConfiguration::LoadFromFile(const std::string& path, ProxyConfiguratio
         errorMessage = "ListenIPAddress is required.";
         return false;
     }
-    ExtractInt(json, "ListenPort", config.ListenPort);
-    ExtractStringArray(json, "OutputIPAddress", config.OutputIPAddress);
-    ExtractStringArray(json, "OutputInterfaceName", config.OutputInterfaceName);
-    ExtractString(json, "DnsServer", config.DnsServer);
-    ExtractInt(json, "MaxConnections", config.MaxConnections);
-    ExtractInt(json, "RunDelayS", config.RunDelayS);
-    ExtractString(json, "Username", config.Username);
-    ExtractString(json, "Password", config.Password);
-    ExtractBoolAsInt(json, "EnableGssapi", config.EnableGssapi);
-    ExtractInt(json, "GssapiMaxProtection", config.GssapiMaxProtection);
-    ExtractMappings(json, config.IPAddressMappings);
+    auto hasKey = [&](const char* key) {
+        return json.find("\"" + std::string(key) + "\"") != std::string::npos;
+    };
+    auto readInt = [&](const char* key, int& value) {
+        if (!hasKey(key) || ExtractInt(json, key, value)) return true;
+        errorMessage = std::string("Invalid integer value for ") + key + ".";
+        return false;
+    };
+    auto readBool = [&](const char* key, int& value) {
+        if (!hasKey(key) || ExtractBoolAsInt(json, key, value)) return true;
+        errorMessage = std::string("Invalid boolean value for ") + key + ".";
+        return false;
+    };
+    auto readString = [&](const char* key, std::string& value) {
+        if (!hasKey(key) || ExtractString(json, key, value)) return true;
+        errorMessage = std::string("Invalid string value for ") + key + ".";
+        return false;
+    };
+    auto readStrings = [&](const char* key, std::vector<std::string>& value) {
+        if (!hasKey(key) || ExtractStringArray(json, key, value)) return true;
+        errorMessage = std::string("Invalid string array for ") + key + ".";
+        return false;
+    };
 
-    ExtractInt(json, "IdleTimeoutMs", config.IdleTimeoutMs);
-    ExtractInt(json, "ConnectTimeoutMs", config.ConnectTimeoutMs);
-    ExtractInt(json, "SendTimeoutMs", config.SendTimeoutMs);
-    ExtractInt(json, "ReceiveTimeoutMs", config.ReceiveTimeoutMs);
-    ExtractInt(json, "DnsSendTimeoutMs", config.DnsSendTimeoutMs);
-    ExtractInt(json, "DnsReceiveTimeoutMs", config.DnsReceiveTimeoutMs);
-    ExtractInt(json, "UdpAssociateIdleTimeoutMs", config.UdpAssociateIdleTimeoutMs);
-    ExtractInt(json, "SendBufferSize", config.SendBufferSize);
-    ExtractInt(json, "ReceiveBufferSize", config.ReceiveBufferSize);
-    ExtractInt(json, "BufferSize", config.BufferSize);
-    ExtractBoolAsInt(json, "NoDelay", config.NoDelay);
-    ExtractBoolAsInt(json, "KeepAlive", config.KeepAlive);
-    ExtractBoolAsInt(json, "LingerEnabled", config.LingerEnabled);
-    ExtractInt(json, "LingerTimeoutSec", config.LingerTimeoutSec);
-    ExtractInt(json, "TcpKeepAliveTime", config.TcpKeepAliveTime);
-    ExtractInt(json, "TcpKeepAliveInterval", config.TcpKeepAliveInterval);
-    ExtractInt(json, "TcpKeepAliveRetryCount", config.TcpKeepAliveRetryCount);
+    if (!readInt("ListenPort", config.ListenPort) ||
+        !readStrings("OutputIPAddress", config.OutputIPAddress) ||
+        !readStrings("OutputInterfaceName", config.OutputInterfaceName) ||
+        !readString("DnsServer", config.DnsServer) ||
+        !readInt("MaxConnections", config.MaxConnections) ||
+        !readInt("RunDelayS", config.RunDelayS) ||
+        !readString("Username", config.Username) ||
+        !readString("Password", config.Password) ||
+        !readBool("EnableGssapi", config.EnableGssapi) ||
+        !readInt("GssapiMaxProtection", config.GssapiMaxProtection) ||
+        !ExtractMappings(json, config.IPAddressMappings) ||
+        !readInt("IdleTimeoutMs", config.IdleTimeoutMs) ||
+        !readInt("ConnectTimeoutMs", config.ConnectTimeoutMs) ||
+        !readInt("SendTimeoutMs", config.SendTimeoutMs) ||
+        !readInt("ReceiveTimeoutMs", config.ReceiveTimeoutMs) ||
+        !readInt("DnsSendTimeoutMs", config.DnsSendTimeoutMs) ||
+        !readInt("DnsReceiveTimeoutMs", config.DnsReceiveTimeoutMs) ||
+        !readInt("UdpAssociateIdleTimeoutMs", config.UdpAssociateIdleTimeoutMs) ||
+        !readInt("SendBufferSize", config.SendBufferSize) ||
+        !readInt("ReceiveBufferSize", config.ReceiveBufferSize) ||
+        !readInt("BufferSize", config.BufferSize) ||
+        !readBool("NoDelay", config.NoDelay) ||
+        !readBool("KeepAlive", config.KeepAlive) ||
+        !readBool("LingerEnabled", config.LingerEnabled) ||
+        !readInt("LingerTimeoutSec", config.LingerTimeoutSec) ||
+        !readInt("TcpKeepAliveTime", config.TcpKeepAliveTime) ||
+        !readInt("TcpKeepAliveInterval", config.TcpKeepAliveInterval) ||
+        !readInt("TcpKeepAliveRetryCount", config.TcpKeepAliveRetryCount)) {
+        if (errorMessage.empty()) {
+            errorMessage = "Invalid IPAddressMappings value.";
+        }
+        return false;
+    }
 
     config.ListenIPAddress = Trim(config.ListenIPAddress);
     config.DnsServer = Trim(config.DnsServer);
@@ -232,8 +267,16 @@ bool ProxyConfiguration::LoadFromFile(const std::string& path, ProxyConfiguratio
 }
 
 bool ProxyConfiguration::IsValid(std::string& errorMessage) const {
-    if (RunDelayS > 0) {
-        std::this_thread::sleep_for(std::chrono::seconds(RunDelayS));
+    if (RunDelayS < 0 || RunDelayS > 86'400) {
+        errorMessage = "RunDelayS must be in the range 0-86400.";
+        return false;
+    }
+
+    const bool hasUsername = !Username.empty();
+    const bool hasPassword = !Password.empty();
+    if (hasUsername != hasPassword) {
+        errorMessage = "Username and Password must either both be set or both be empty.";
+        return false;
     }
 
     if (!NetworkConfiguration::SetServerInterfaceIP(ListenIPAddress, ListenPort, errorMessage)) {
@@ -271,6 +314,16 @@ bool ProxyConfiguration::IsValid(std::string& errorMessage) const {
         }
     }
 
+    if (!NetworkConfiguration::SetSocketOptions(
+            IdleTimeoutMs, ConnectTimeoutMs, SendTimeoutMs, ReceiveTimeoutMs,
+            DnsSendTimeoutMs, DnsReceiveTimeoutMs, UdpAssociateIdleTimeoutMs,
+            SendBufferSize, ReceiveBufferSize, BufferSize,
+            NoDelay, KeepAlive, LingerEnabled, LingerTimeoutSec,
+            TcpKeepAliveTime, TcpKeepAliveInterval, TcpKeepAliveRetryCount,
+            errorMessage)) {
+        return false;
+    }
+
     if (!DnsServer.empty()) {
         if (!NetworkConfiguration::SetDnsIP(DnsServer, errorMessage)) {
             return false;
@@ -294,16 +347,6 @@ bool ProxyConfiguration::IsValid(std::string& errorMessage) const {
         NetworkConfiguration::GssapiMaxProtection = GssapiMaxProtection;
     } else if (GssapiMaxProtection != -1) {
         errorMessage = "GssapiMaxProtection must be 1 (integrity), 2 (confidentiality), or 3 (selective).";
-        return false;
-    }
-
-    if (!NetworkConfiguration::SetSocketOptions(
-            IdleTimeoutMs, ConnectTimeoutMs, SendTimeoutMs, ReceiveTimeoutMs,
-            DnsSendTimeoutMs, DnsReceiveTimeoutMs, UdpAssociateIdleTimeoutMs,
-            SendBufferSize, ReceiveBufferSize, BufferSize,
-            NoDelay, KeepAlive, LingerEnabled, LingerTimeoutSec,
-            TcpKeepAliveTime, TcpKeepAliveInterval, TcpKeepAliveRetryCount,
-            errorMessage)) {
         return false;
     }
 

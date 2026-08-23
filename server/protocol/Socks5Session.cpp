@@ -6,13 +6,27 @@
 #include "../../network/Network.h"
 #include "../../utils/Logger.h"
 
+#include <WinSock2.h>
+#include <WS2tcpip.h>
 #include <mstcpip.h>
 
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
 
 namespace {
 constexpr size_t kProtoBuf = 4096;
 constexpr size_t kMaxRelayQueueDepth = 32;
+constexpr size_t kMaxProtocolBuffered = 1024 * 1024;
+constexpr size_t kGssRelayChunk = 16 * 1024;
 
 std::string DescribeNonSocks5FirstByte(uint8_t b) {
     switch (b) {
@@ -33,6 +47,17 @@ std::string DescribeNonSocks5FirstByte(uint8_t b) {
         }
         return "Expected SOCKS5 handshake (first byte 0x05), not this protocol.";
     }
+}
+
+bool ConstantTimeEqual(std::string_view lhs, std::string_view rhs) {
+    const size_t maxLength = (std::max)(lhs.size(), rhs.size());
+    unsigned difference = static_cast<unsigned>(lhs.size() ^ rhs.size());
+    for (size_t i = 0; i < maxLength; ++i) {
+        const unsigned a = i < lhs.size() ? static_cast<unsigned char>(lhs[i]) : 0;
+        const unsigned b = i < rhs.size() ? static_cast<unsigned char>(rhs[i]) : 0;
+        difference |= a ^ b;
+    }
+    return difference == 0;
 }
 }
 
@@ -120,7 +145,7 @@ void Socks5Session::ConfigureSocket(SOCKET s) {
 }
 
 bool Socks5Session::Start() {
-    if (!iocp_.Associate(client_, this)) {
+    if (!iocp_.Associate(client_, shared_from_this())) {
         return false;
     }
 
@@ -134,6 +159,7 @@ bool Socks5Session::Start() {
 }
 
 void Socks5Session::Close() {
+    std::lock_guard completionLock(completionMutex_);
     if (closed_.exchange(true)) {
         return;
     }
@@ -150,7 +176,7 @@ void Socks5Session::Close() {
     if (udpRelay_) {
         auto relay = std::move(udpRelay_);
         relay->Stop(false);
-        relay->WaitPendingZero(3000);
+        relay->WaitPendingZero(-1);
     }
 
     if (client_ != INVALID_SOCKET) {
@@ -174,23 +200,32 @@ void Socks5Session::ArmIdleTimer() {
         state_ == SessionState::Resolving || state_ == SessionState::Connecting) {
         return;
     }
-    idleTimerId_ = iocp_.ScheduleTimeout(this, kTimerIdle, NetworkConfiguration::IdleTimeoutMs);
+    const uint64_t generation = ++idleTimerGeneration_;
+    idleTimerId_ = iocp_.ScheduleTimeout(
+        shared_from_this(), (generation << 8) | kTimerIdle,
+        NetworkConfiguration::IdleTimeoutMs);
 }
 
 void Socks5Session::CancelIdleTimer() {
+    ++idleTimerGeneration_;
     if (idleTimerId_ != 0) {
         iocp_.CancelTimeout(idleTimerId_);
         idleTimerId_ = 0;
     }
 }
 
-void Socks5Session::ArmConnectTimer() {
+bool Socks5Session::ArmConnectTimer() {
     CancelConnectTimer();
-    if (NetworkConfiguration::ConnectTimeoutMs <= 0) return;
-    connectTimerId_ = iocp_.ScheduleTimeout(this, kTimerConnect, NetworkConfiguration::ConnectTimeoutMs);
+    if (NetworkConfiguration::ConnectTimeoutMs <= 0) return true;
+    const uint64_t generation = ++connectTimerGeneration_;
+    connectTimerId_ = iocp_.ScheduleTimeout(
+        shared_from_this(), (generation << 8) | kTimerConnect,
+        NetworkConfiguration::ConnectTimeoutMs);
+    return connectTimerId_ != 0;
 }
 
 void Socks5Session::CancelConnectTimer() {
+    ++connectTimerGeneration_;
     if (connectTimerId_ != 0) {
         iocp_.CancelTimeout(connectTimerId_);
         connectTimerId_ = 0;
@@ -210,6 +245,16 @@ void Socks5Session::RequestCloseAfterFlush() {
 }
 
 void Socks5Session::FailAndClose(uint8_t replyCode) {
+    if (closed_ || state_ == SessionState::Closing) {
+        return;
+    }
+    state_ = SessionState::Closing;
+    CancelConnectTimer();
+    CancelIdleTimer();
+    if (dest_ != INVALID_SOCKET) {
+        closesocket(dest_);
+        dest_ = INVALID_SOCKET;
+    }
     SendSocksReply(replyCode);
     RequestCloseAfterFlush();
 }
@@ -223,7 +268,7 @@ void Socks5Session::OnUdpRelayStopped() {
 bool Socks5Session::BeginClientRead() {
     if (closed_ || clientIo_.reading) return false;
     clientIo_.reading = true;
-    if (!iocp_.PostRecv(client_, &clientIo_.recvCtx, this)) {
+    if (!iocp_.PostRecv(client_, &clientIo_.recvCtx, shared_from_this())) {
         clientIo_.reading = false;
         Close();
         return false;
@@ -232,12 +277,12 @@ bool Socks5Session::BeginClientRead() {
 }
 
 void Socks5Session::OnIoCompleted(DWORD bytes, DWORD error, IoContext* ctx) {
-    if (closed_) return;
-
     if (!ctx) {
         Close();
         return;
     }
+
+    if (closed_) return;
 
     if (ctx->op == IoOp::User) {
         // DNS completion uses dnsCtx_ without userKey; timers set userKey.
@@ -246,7 +291,6 @@ void Socks5Session::OnIoCompleted(DWORD bytes, DWORD error, IoContext* ctx) {
             return;
         }
         OnTimer(ctx->userKey);
-        delete ctx; // heap timer contexts from ScheduleTimeout
         return;
     }
 
@@ -276,7 +320,10 @@ void Socks5Session::OnIoCompleted(DWORD bytes, DWORD error, IoContext* ctx) {
 
 void Socks5Session::OnTimer(uint64_t kind) {
     if (closed_) return;
-    if (kind == kTimerConnect) {
+    const uint64_t timerKind = kind & 0xFF;
+    const uint64_t generation = kind >> 8;
+    if (timerKind == kTimerConnect) {
+        if (generation != connectTimerGeneration_) return;
         connectTimerId_ = 0;
         if (state_ != SessionState::Connecting) return;
         Logger::Instance().Warning("Connect timed out.");
@@ -287,15 +334,14 @@ void Socks5Session::OnTimer(uint64_t kind) {
         FailAndClose(socks5::ReplyCode::TtlExpired);
         return;
     }
-    if (kind == kTimerIdle) {
+    if (timerKind == kTimerIdle) {
+        if (generation != idleTimerGeneration_) return;
         idleTimerId_ = 0;
-        if (state_ == SessionState::Relaying || state_ == SessionState::UdpAssociate) return;
-        if (state_ == SessionState::Resolving) {
-            Logger::Instance().Warning("Session idle timeout during DNS resolve.");
-            FailAndClose(socks5::ReplyCode::TtlExpired);
+        if (state_ == SessionState::Relaying || state_ == SessionState::UdpAssociate ||
+            state_ == SessionState::Resolving || state_ == SessionState::Connecting ||
+            state_ == SessionState::Closing) {
             return;
         }
-        if (state_ == SessionState::Connecting) return;
         Logger::Instance().Warning("Session idle timeout during handshake/request.");
         Close();
     }
@@ -331,6 +377,12 @@ void Socks5Session::OnClientRecv(DWORD bytes, DWORD error) {
         return;
     }
 
+    if (bytes > kMaxProtocolBuffered ||
+        ingest_.size() > kMaxProtocolBuffered - static_cast<size_t>(bytes)) {
+        Logger::Instance().Warning("SOCKS protocol input exceeded the buffering limit.");
+        Close();
+        return;
+    }
     ingest_.insert(ingest_.end(),
                    clientIo_.recvCtx.buffer.begin(),
                    clientIo_.recvCtx.buffer.begin() + static_cast<std::ptrdiff_t>(bytes));
@@ -462,7 +514,7 @@ bool Socks5Session::TryPostRelayRead(StreamTag receiver) {
     }
 
     recvIo.reading = true;
-    if (!iocp_.PostRecv(sock, &recvIo.recvCtx, this)) {
+    if (!iocp_.PostRecv(sock, &recvIo.recvCtx, shared_from_this())) {
         recvIo.reading = false;
         Close();
         return false;
@@ -498,10 +550,35 @@ void Socks5Session::OnRelayData(StreamTag from, size_t bytes) {
     srcIo.recvCtx.buffer.resize(static_cast<size_t>(NetworkConfiguration::BufferSize));
 
     if (from == StreamTag::Client) {
-        QueueDestSend(std::move(chunk));
+        if (gssProtectActive_) {
+            if (chunk.size() > kMaxProtocolBuffered ||
+                ingest_.size() > kMaxProtocolBuffered - chunk.size()) {
+                Close();
+                return;
+            }
+            ingest_.insert(ingest_.end(), chunk.begin(), chunk.end());
+            if (!ProcessGssRelayInput()) {
+                Close();
+                return;
+            }
+        } else {
+            QueueDestSend(std::move(chunk));
+        }
         TryPostRelayRead(StreamTag::Client);
     } else {
-        QueueClientSendRaw(std::move(chunk));
+        if (gssProtectActive_) {
+            for (size_t offset = 0; offset < chunk.size(); offset += kGssRelayChunk) {
+                const size_t count = (std::min)(kGssRelayChunk, chunk.size() - offset);
+                std::vector<char> part(chunk.begin() + static_cast<std::ptrdiff_t>(offset),
+                                       chunk.begin() + static_cast<std::ptrdiff_t>(offset + count));
+                if (!WrapAndQueueClient(part)) {
+                    Close();
+                    return;
+                }
+            }
+        } else {
+            QueueClientSendRaw(std::move(chunk));
+        }
         TryPostRelayRead(StreamTag::Dest);
     }
 }
@@ -534,6 +611,9 @@ bool Socks5Session::WrapAndQueueClient(const std::vector<char>& cleartext) {
                        gssapi_->ConfidentialityAvailable());
     std::vector<uint8_t> token;
     if (!gssapi_->Wrap(reinterpret_cast<const uint8_t*>(cleartext.data()), cleartext.size(), conf, token)) {
+        return false;
+    }
+    if (token.size() > 65535) {
         return false;
     }
     SendGssFrame(socks5::Gssapi::MsgEncapsulated, token.data(), token.size());
@@ -576,6 +656,30 @@ int Socks5Session::TryReadGssFrame(uint8_t expectedMtyp, std::vector<uint8_t>& t
     return 1;
 }
 
+bool Socks5Session::ProcessGssRelayInput() {
+    while (!ingest_.empty()) {
+        std::vector<uint8_t> token;
+        const int result = TryReadGssFrame(socks5::Gssapi::MsgEncapsulated, token);
+        if (result == 0) {
+            return true;
+        }
+        if (result < 0) {
+            return false;
+        }
+
+        std::vector<uint8_t> clear;
+        if (!gssapi_ || !gssapi_->Unwrap(token.data(), token.size(), clear)) {
+            return false;
+        }
+        if (!clear.empty()) {
+            QueueDestSend(std::vector<char>(
+                reinterpret_cast<const char*>(clear.data()),
+                reinterpret_cast<const char*>(clear.data()) + clear.size()));
+        }
+    }
+    return true;
+}
+
 bool Socks5Session::EnsureCleartextRequestIngest() {
     if (!gssProtectActive_ || gssRequestUnwrapped_) return true;
     std::vector<uint8_t> token;
@@ -614,7 +718,7 @@ void Socks5Session::PumpSend(StreamTag tag) {
     const size_t offset = io.sendFrontOffset;
     const size_t len = front.size() - offset;
     io.sending = true;
-    if (!iocp_.PostSend(sock, &io.sendCtx, front.data(), offset, len, this)) {
+    if (!iocp_.PostSend(sock, &io.sendCtx, front.data(), offset, len, shared_from_this())) {
         io.sending = false;
         Close();
     }
@@ -695,8 +799,8 @@ bool Socks5Session::ProcessAuthBuffer() {
     const std::string password(ingest_.data() + 3 + ulen, plen);
     ingest_.erase(ingest_.begin(), ingest_.begin() + static_cast<std::ptrdiff_t>(2u + ulen + 1u + plen));
 
-    const bool ok = username == NetworkConfiguration::Username &&
-                    password == NetworkConfiguration::Password;
+    const bool ok = ConstantTimeEqual(username, NetworkConfiguration::Username) &
+                    ConstantTimeEqual(password, NetworkConfiguration::Password);
     QueueClientSendRaw({static_cast<char>(socks5::AuthProtocol::Version),
                         static_cast<char>(ok ? socks5::AuthProtocol::Success
                                              : socks5::AuthProtocol::Failure)});
@@ -726,6 +830,10 @@ bool Socks5Session::ProcessGssapiAuthBuffer() {
     std::vector<uint8_t> outToken;
     const auto status = gssapi_->AcceptToken(token.data(), token.size(), outToken);
     if (status == GssapiContext::AcceptStatus::Failed) {
+        SendGssAbort();
+        return false;
+    }
+    if (outToken.size() > 65535) {
         SendGssAbort();
         return false;
     }
@@ -784,6 +892,10 @@ bool Socks5Session::ProcessGssapiProtectBuffer() {
     const uint8_t levelByte = selected;
     std::vector<uint8_t> wrapped;
     if (!gssapi_->Wrap(&levelByte, 1, false, wrapped)) {
+        SendGssAbort();
+        return false;
+    }
+    if (wrapped.size() > 65535) {
         SendGssAbort();
         return false;
     }
@@ -864,9 +976,14 @@ bool Socks5Session::ProcessRequestBuffer() {
         try {
             Logger::Instance().Info("Setting up UDP ASSOCIATE.");
             auto self = std::static_pointer_cast<Socks5Session>(shared_from_this());
+            std::weak_ptr<Socks5Session> weakSelf = self;
             udpRelay_ = std::make_shared<UdpRelay>(
                 iocp_, dns_, clientEp_, clientLocalEp_, resolver_,
-                [self] { self->OnUdpRelayStopped(); });
+                [weakSelf] {
+                    if (auto session = weakSelf.lock()) {
+                        session->OnUdpRelayStopped();
+                    }
+                });
             if (!udpRelay_->Start()) {
                 FailAndClose(socks5::ReplyCode::GeneralFailure);
                 return true;
@@ -913,9 +1030,12 @@ bool Socks5Session::StartConnect(const std::string& address, uint16_t port) {
 
     auto self = std::static_pointer_cast<Socks5Session>(shared_from_this());
     dns_.ResolveAsync(address, [self](std::optional<std::string> ip) {
+        std::lock_guard completionLock(self->completionMutex_);
         if (self->closed_) return;
         self->dnsResult_ = std::move(ip);
-        self->iocp_.PostUser(self.get(), &self->dnsCtx_);
+        if (!self->iocp_.PostUser(self, &self->dnsCtx_)) {
+            self->Close();
+        }
     });
     return true;
 }
@@ -983,7 +1103,7 @@ bool Socks5Session::ConnectToHost(const std::string& address, const std::string&
         return false;
     }
 
-    if (!iocp_.Associate(dest_, this)) {
+    if (!iocp_.Associate(dest_, shared_from_this())) {
         closesocket(dest_);
         dest_ = INVALID_SOCKET;
         FailAndClose(socks5::ReplyCode::GeneralFailure);
@@ -999,18 +1119,24 @@ bool Socks5Session::ConnectToHost(const std::string& address, const std::string&
     }
 
     const int addrLen = destFamily == AF_INET ? sizeof(sockaddr_in) : sizeof(sockaddr_in6);
-    if (!iocp_.PostConnect(dest_, &connectCtx_, reinterpret_cast<sockaddr*>(&destStorage), addrLen, this)) {
+    if (!iocp_.PostConnect(dest_, &connectCtx_, reinterpret_cast<sockaddr*>(&destStorage), addrLen, shared_from_this())) {
         closesocket(dest_);
         dest_ = INVALID_SOCKET;
         FailAndClose(socks5::ReplyCode::GeneralFailure);
         return false;
     }
-    ArmConnectTimer();
+    if (!ArmConnectTimer()) {
+        FailAndClose(socks5::ReplyCode::GeneralFailure);
+        return false;
+    }
     return true;
 }
 
 void Socks5Session::OnDestConnect(DWORD error) {
     CancelConnectTimer();
+    if (state_ != SessionState::Connecting) {
+        return;
+    }
     if (error != 0) {
         uint8_t code = socks5::ReplyCode::GeneralFailure;
         if (error == WSAETIMEDOUT) code = socks5::ReplyCode::TtlExpired;
@@ -1058,14 +1184,26 @@ void Socks5Session::OnDestConnect(DWORD error) {
 void Socks5Session::StartRelay() {
     state_ = SessionState::Relaying;
     CancelIdleTimer();
-    ingest_.clear();
     Logger::Instance().Debug("Starting data forwarding.");
+
+    if (!ingest_.empty()) {
+        if (gssProtectActive_) {
+            if (!ProcessGssRelayInput()) {
+                Close();
+                return;
+            }
+        } else {
+            std::vector<char> pipelined;
+            pipelined.swap(ingest_);
+            QueueDestSend(std::move(pipelined));
+        }
+    }
 
     if (!clientIo_.reading) {
         BeginClientRead();
     }
     destIo_.reading = true;
-    if (!iocp_.PostRecv(dest_, &destIo_.recvCtx, this)) {
+    if (!iocp_.PostRecv(dest_, &destIo_.recvCtx, shared_from_this())) {
         destIo_.reading = false;
         Close();
     }
