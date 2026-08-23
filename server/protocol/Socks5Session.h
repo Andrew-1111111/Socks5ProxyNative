@@ -126,6 +126,7 @@ private:
     StreamIo destIo_;
     IoContext connectCtx_{IoOp::Connect};
     IoContext dnsCtx_{IoOp::User};
+    IoContext udpStopCtx_{IoOp::User};
 
     IocpService::TimerId connectTimerId_ = 0;
     IocpService::TimerId idleTimerId_ = 0;

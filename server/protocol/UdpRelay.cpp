@@ -223,18 +223,27 @@ void UdpRelay::OnIoCompleted(DWORD bytes, DWORD error, IoContext* ctx) {
             return;
         }
 
-        PostNextRecv();
+        if (!PostNextRecv()) {
+            Logger::Instance().Error("Failed to repost UDP relay receive; stopping relay");
+            Stop(true);
+        }
         return;
     }
 }
 
 void UdpRelay::OnSendCompleted(IoContext* ctx) {
     std::lock_guard lock(stateMutex_);
+    bool found = false;
     for (auto it = inFlightSends_.begin(); it != inFlightSends_.end(); ++it) {
         if (&(*it)->ctx == ctx) {
             inFlightSends_.erase(it);
+            found = true;
             break;
         }
+    }
+    if (!found) {
+        Logger::Instance().Warning("Unexpected UDP send completion context");
+        return;
     }
     if (sendsInFlight_ > 0) {
         --sendsInFlight_;

@@ -40,8 +40,8 @@ public:
     virtual ~IocpHandle() = default;
     virtual void OnIoCompleted(DWORD bytes, DWORD error, IoContext* ctx) = 0;
 
-    void AddPending() { pending_.fetch_add(1, std::memory_order_acq_rel); }
-    void ReleasePending() { pending_.fetch_sub(1, std::memory_order_acq_rel); }
+    void AddPending();
+    void ReleasePending();
     int Pending() const { return pending_.load(std::memory_order_acquire); }
     /// Wait until outstanding IOCP ops complete (after cancel/close).
     bool WaitPendingZero(int timeoutMs = 5000) const;
@@ -54,6 +54,8 @@ protected:
 private:
     friend class IocpService;
     std::atomic<int> pending_{0};
+    mutable std::mutex pendingMutex_;
+    mutable std::condition_variable pendingCv_;
 };
 
 struct IoContext : OVERLAPPED {
@@ -71,6 +73,12 @@ struct IoContext : OVERLAPPED {
     bool iocpOwned = false;
     /// Pins IocpHandle lifetime until this I/O completes.
     std::shared_ptr<IocpHandle> handlePin;
+    /// Independent accounting pin used to recover completion bookkeeping.
+    std::shared_ptr<IocpHandle> accountingPin;
+    /// Owns a snapshot used by PostSend/PostSendTo external-buffer overloads.
+    std::shared_ptr<std::vector<char>> bufferPin;
+    /// Socket/HANDLE on which the overlapped operation was issued.
+    SOCKET cancellationSocket = INVALID_SOCKET;
 
     explicit IoContext(IoOp operation = IoOp::Recv, size_t bufSize = 0);
     void Reset(IoOp operation);
@@ -87,6 +95,9 @@ public:
     IocpService& operator=(const IocpService&) = delete;
 
     bool Start();
+    /// Cancels registered socket I/O, then blocks until every posted operation completes.
+    /// Socket ownership remains with the caller; Stop() never closes sockets.
+    /// Must not be called from an OnIoCompleted callback.
     void Stop();
 
     bool Associate(SOCKET socket, const std::shared_ptr<IocpHandle>& handle);
@@ -95,17 +106,18 @@ public:
                   size_t offset = 0, size_t length = 0);
     bool PostSend(SOCKET socket, IoContext* ctx, size_t offset, size_t length,
                   const std::shared_ptr<IocpHandle>& handle);
-    /// Send from caller-owned buffer (must stay valid until completion).
+    /// Takes an internal snapshot of the requested caller buffer range.
     bool PostSend(SOCKET socket, IoContext* ctx, char* data, size_t offset, size_t length,
                   const std::shared_ptr<IocpHandle>& handle);
     bool PostRecvFrom(SOCKET socket, IoContext* ctx, const std::shared_ptr<IocpHandle>& handle);
     bool PostSendTo(SOCKET socket, IoContext* ctx, size_t length,
                     const sockaddr* to, int toLen, const std::shared_ptr<IocpHandle>& handle);
-    /// SendTo from caller-owned buffer (must stay valid until completion).
+    /// Takes an internal snapshot of the caller buffer.
     bool PostSendTo(SOCKET socket, IoContext* ctx, char* data, size_t length,
                     const sockaddr* to, int toLen, const std::shared_ptr<IocpHandle>& handle);
     bool PostConnect(SOCKET socket, IoContext* ctx, const sockaddr* name, int namelen,
                      const std::shared_ptr<IocpHandle>& handle);
+    /// addrBuf must refer to ctx->buffer, which owns the storage until completion.
     bool PostAccept(SOCKET listenSocket, SOCKET acceptSocket, IoContext* ctx,
                     char* addrBuf, DWORD addrBufLen, const std::shared_ptr<IocpHandle>& handle,
                     LPFN_ACCEPTEX acceptEx);
@@ -124,7 +136,7 @@ public:
     bool IsRunning() const { return running_.load(std::memory_order_acquire); }
 
 private:
-    enum class TimerPhase : uint8_t { Pending, Claimed, Cancelled };
+    enum class TimerPhase : uint8_t { Publishing, Pending, Claimed, Cancelled };
 
     struct TimerState {
         TimerId id = 0;
@@ -137,8 +149,8 @@ private:
     void WorkerLoop();
     DWORD AdvanceTimers();
     void ClearTimers();
-
-    static bool EnsureConnectEx(SOCKET socketHint = INVALID_SOCKET);
+    void CancelOutstandingSocketIo();
+    void WakeWorkers(HANDLE iocp, size_t count);
 
     /// RAII: pins IOCP handle for worker IO until destroyed.
     class IocpLease {
@@ -159,14 +171,26 @@ private:
 
     void PinIocpHandle();
     void UnpinIocpHandle();
+    void AddOutstanding(IoContext& ctx, const std::shared_ptr<IocpHandle>& handle,
+                        SOCKET cancellationSocket = INVALID_SOCKET);
+    void UnregisterPendingSocket(SOCKET cancellationSocket);
+    void ReleaseOutstanding(IocpHandle& handle, SOCKET cancellationSocket);
+    void ReleaseOutstandingWithoutHandle(SOCKET cancellationSocket);
+    void WaitOutstandingZero() const;
     bool PostIocpCompletion(HANDLE iocp, DWORD bytes, ULONG_PTR key, OVERLAPPED* overlapped);
 
     HANDLE iocp_ = nullptr;
     std::atomic<int> iocpUsers_{0};
+    std::atomic<int> outstandingIo_{0};
     std::atomic<bool> running_{false};
     std::atomic<bool> stopping_{false};
     mutable std::mutex iocpIdleMutex_;
     mutable std::condition_variable iocpIdleCv_;
+    mutable std::mutex outstandingMutex_;
+    mutable std::condition_variable outstandingCv_;
+    std::mutex pendingSocketMutex_;
+    std::unordered_map<SOCKET, size_t> pendingSockets_;
+    std::mutex transitionMutex_;
     unsigned workerCount_ = 4;
     std::vector<std::thread> workers_;
 

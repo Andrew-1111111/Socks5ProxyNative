@@ -282,12 +282,22 @@ void Socks5Session::OnIoCompleted(DWORD bytes, DWORD error, IoContext* ctx) {
         return;
     }
 
-    if (closed_) return;
+    if (closed_) {
+        if (ctx == &clientIo_.recvCtx) clientIo_.reading = false;
+        if (ctx == &clientIo_.sendCtx) clientIo_.sending = false;
+        if (ctx == &destIo_.recvCtx) destIo_.reading = false;
+        if (ctx == &destIo_.sendCtx) destIo_.sending = false;
+        return;
+    }
 
     if (ctx->op == IoOp::User) {
         // DNS completion uses dnsCtx_ without userKey; timers set userKey.
         if (ctx == &dnsCtx_) {
             OnDnsResolved();
+            return;
+        }
+        if (ctx == &udpStopCtx_) {
+            OnUdpRelayStopped();
             return;
         }
         OnTimer(ctx->userKey);
@@ -981,7 +991,7 @@ bool Socks5Session::ProcessRequestBuffer() {
                 iocp_, dns_, clientEp_, clientLocalEp_, resolver_,
                 [weakSelf] {
                     if (auto session = weakSelf.lock()) {
-                        session->OnUdpRelayStopped();
+                        session->iocp_.PostUser(session, &session->udpStopCtx_);
                     }
                 });
             if (!udpRelay_->Start()) {
@@ -1151,8 +1161,6 @@ void Socks5Session::OnDestConnect(DWORD error) {
         FailAndClose(code);
         return;
     }
-
-    setsockopt(dest_, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, nullptr, 0);
 
     sockaddr_storage local{};
     int localLen = sizeof(local);

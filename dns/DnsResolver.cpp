@@ -65,6 +65,7 @@ public:
     }
 
     void Cancel() {
+        std::lock_guard completionLock(completionMutex_);
         std::lock_guard lock(stateMutex_);
         done_ = true;
         if (socket_ != INVALID_SOCKET) {
@@ -130,9 +131,6 @@ public:
 
         switch (phase_) {
         case Phase::Connect: {
-            // MSDN: SO_UPDATE_CONNECT_CONTEXT requires NULL / 0 after ConnectEx.
-            setsockopt(socket_, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, nullptr, 0);
-
             sendCtx_.buffer.resize(2 + query_.size());
             sendCtx_.buffer[0] = static_cast<char>((query_.size() >> 8) & 0xFF);
             sendCtx_.buffer[1] = static_cast<char>(query_.size() & 0xFF);
@@ -503,11 +501,17 @@ void DnsResolver::PumpSendLocked() {
 
 void DnsResolver::OnUdpSendCompleted(IoContext* ctx) {
     std::lock_guard lock(mutex_);
+    bool found = false;
     for (auto it = inFlightSends_.begin(); it != inFlightSends_.end(); ++it) {
         if (&(*it)->ctx == ctx) {
             inFlightSends_.erase(it);
+            found = true;
             break;
         }
+    }
+    if (!found) {
+        Logger::Instance().Warning("Unexpected DNS UDP send completion context");
+        return;
     }
     if (sendsInFlight_ > 0) {
         --sendsInFlight_;
@@ -659,6 +663,20 @@ void DnsResolver::OnIoCompleted(DWORD bytes, DWORD error, IoContext* ctx) {
                     "Failed to repost DNS UDP receive; falling back to TCP for pending queries.");
                 closesocket(udpSocket_);
                 udpSocket_ = INVALID_SOCKET;
+                std::vector<std::shared_ptr<PendingQuery>> fallback;
+                {
+                    std::lock_guard lock(mutex_);
+                    pendingSends_.clear();
+                    for (const auto& [txid, pending] : byId_) {
+                        (void)txid;
+                        if (pending && !pending->viaTcp) {
+                            fallback.push_back(pending);
+                        }
+                    }
+                }
+                for (const auto& pending : fallback) {
+                    StartTcpFallback(pending);
+                }
             }
         }
         return;

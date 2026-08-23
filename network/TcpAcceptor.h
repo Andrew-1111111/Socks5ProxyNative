@@ -2,6 +2,7 @@
 
 #include "Iocp.h"
 
+#include <cstddef>
 #include <functional>
 #include <memory>
 #include <vector>
@@ -22,12 +23,11 @@ public:
 
 private:
     struct AcceptIo {
-        IoContext ctx;
-        SOCKET acceptSocket = INVALID_SOCKET;
-        // AcceptEx local+remote address block
-        char addrBuf[2 * (sizeof(sockaddr_storage) + 16)]{};
+        static constexpr size_t kAddressBufferSize =
+            2 * (sizeof(sockaddr_storage) + 16);
 
-        AcceptIo() : ctx(IoOp::Accept, 0) {}
+        IoContext ctx{IoOp::Accept, kAddressBufferSize};
+        SOCKET acceptSocket = INVALID_SOCKET;
     };
 
     bool PostAccept(AcceptIo& io);

@@ -11,16 +11,20 @@
 #include <climits>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 namespace {
+
+thread_local IocpService* g_currentIocpWorker = nullptr;
 
 bool FitsULong(size_t value) {
     return value <= static_cast<size_t>(ULONG_MAX);
@@ -65,23 +69,18 @@ bool ValidAcceptExAddrBuf(char* addrBuf, DWORD addrBufLen) {
     return addrBuf != nullptr && addrBufLen >= kMinAddrBufLen && (addrBufLen % 2) == 0;
 }
 
-void BindContext(IoContext* ctx, const std::shared_ptr<IocpHandle>& handle) {
-    ctx->handlePin = handle;
+void ClearContextPins(IoContext* ctx) {
+    ctx->handlePin.reset();
+    ctx->accountingPin.reset();
+    ctx->cancellationSocket = INVALID_SOCKET;
 }
 
-void CleanupClaimedContexts(std::vector<IoContext*>& claimed) {
-    for (IoContext* ctx : claimed) {
-        if (ctx && ctx->handlePin) {
-            ctx->handlePin->ReleasePending();
-        }
-        if (ctx && ctx->iocpOwned) {
-            delete ctx;
-        }
-    }
-    claimed.clear();
+bool IsBoundForConnectEx(SOCKET socket, int family) {
+    sockaddr_storage local{};
+    int localLen = sizeof(local);
+    return getsockname(socket, reinterpret_cast<sockaddr*>(&local), &localLen) == 0 &&
+           local.ss_family == family;
 }
-
-std::atomic<LPFN_CONNECTEX> g_connectEx{nullptr};
 
 }  // namespace
 
@@ -95,28 +94,52 @@ IoContext::IoContext(IoOp operation, size_t bufSize) : op(operation) {
 }
 
 void IoContext::Reset(IoOp operation) {
+    if (handlePin || accountingPin) {
+        OutputDebugStringA("Attempted to reset an outstanding IoContext\n");
+        return;
+    }
     std::memset(static_cast<OVERLAPPED*>(this), 0, sizeof(OVERLAPPED));
     op = operation;
     flags = 0;
     sendOffset = 0;
     sendLength = 0;
     userKey = 0;
-    iocpOwned = false;
-    handlePin.reset();
+    bufferPin.reset();
+    cancellationSocket = INVALID_SOCKET;
     addrLen = sizeof(addr);
 }
 
-bool IocpHandle::WaitPendingZero(int timeoutMs) const {
-    using clock = std::chrono::steady_clock;
-    const std::chrono::steady_clock::time_point deadline =
-        clock::now() + std::chrono::milliseconds(timeoutMs < 0 ? 0 : timeoutMs);
-    while (pending_.load(std::memory_order_acquire) > 0) {
-        if (timeoutMs >= 0 && clock::now() >= deadline) {
-            return false;
-        }
-        Sleep(1);
+void IocpHandle::AddPending() {
+    pending_.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void IocpHandle::ReleasePending() {
+    int previous = pending_.load(std::memory_order_acquire);
+    while (previous > 0 &&
+           !pending_.compare_exchange_weak(previous, previous - 1,
+                                           std::memory_order_acq_rel,
+                                           std::memory_order_acquire)) {
     }
-    return true;
+    if (previous <= 0) {
+        OutputDebugStringA("IocpHandle pending counter underflow\n");
+        return;
+    }
+    if (previous == 1) {
+        std::lock_guard lock(pendingMutex_);
+        pendingCv_.notify_all();
+    }
+}
+
+bool IocpHandle::WaitPendingZero(int timeoutMs) const {
+    std::unique_lock lock(pendingMutex_);
+    const auto idle = [this] {
+        return pending_.load(std::memory_order_acquire) == 0;
+    };
+    if (timeoutMs < 0) {
+        pendingCv_.wait(lock, idle);
+        return true;
+    }
+    return pendingCv_.wait_for(lock, std::chrono::milliseconds(timeoutMs), idle);
 }
 
 IocpService::IocpService(unsigned workerCount) {
@@ -135,6 +158,7 @@ IocpService::~IocpService() {
 }
 
 bool IocpService::Start() {
+    std::lock_guard transition(transitionMutex_);
     std::unique_lock lock(lifecycleMutex_);
     if (stopping_.load(std::memory_order_acquire)) {
         return false;
@@ -163,9 +187,7 @@ bool IocpService::Start() {
     } catch (...) {
         running_.store(false, std::memory_order_release);
         stopping_.store(true, std::memory_order_release);
-        for (size_t i = 0; i < workers_.size(); ++i) {
-            PostQueuedCompletionStatus(iocp_, 0, 0, nullptr);
-        }
+        WakeWorkers(iocp_, workers_.size());
 
         lock.unlock();
         for (std::thread& worker : workers_) {
@@ -176,6 +198,7 @@ bool IocpService::Start() {
         lock.lock();
 
         workers_.clear();
+        WaitIocpIdle();
         CloseHandle(iocp_);
         iocp_ = nullptr;
         stopping_.store(false, std::memory_order_release);
@@ -186,7 +209,13 @@ bool IocpService::Start() {
 }
 
 void IocpService::Stop() {
+    if (g_currentIocpWorker == this) {
+        OutputDebugStringA("IocpService::Stop cannot run from its completion worker\n");
+        return;
+    }
+    std::lock_guard transition(transitionMutex_);
     HANDLE iocpToClose = nullptr;
+    size_t workerCount = 0;
 
     {
         std::unique_lock lock(lifecycleMutex_);
@@ -198,10 +227,17 @@ void IocpService::Stop() {
         ClearTimers();
 
         iocpToClose = iocp_;
-        if (iocpToClose) {
-            for (unsigned i = 0; i < workers_.size(); ++i) {
-                PostQueuedCompletionStatus(iocpToClose, 0, 0, nullptr);
-            }
+        workerCount = workers_.size();
+        CancelOutstandingSocketIo();
+        WakeWorkers(iocpToClose, workerCount);
+    }
+
+    WaitOutstandingZero();
+
+    {
+        std::shared_lock lock(lifecycleMutex_);
+        if (iocp_ == iocpToClose && iocpToClose) {
+            WakeWorkers(iocpToClose, workerCount);
         }
     }
 
@@ -255,11 +291,79 @@ void IocpService::PinIocpHandle() {
 }
 
 void IocpService::UnpinIocpHandle() {
-    const int prev = iocpUsers_.fetch_sub(1, std::memory_order_acq_rel);
-    if (prev == 1) {
+    int previous = iocpUsers_.load(std::memory_order_acquire);
+    while (previous > 0 &&
+           !iocpUsers_.compare_exchange_weak(previous, previous - 1,
+                                             std::memory_order_acq_rel,
+                                             std::memory_order_acquire)) {
+    }
+    if (previous <= 0) {
+        OutputDebugStringA("IocpService IOCP user counter underflow\n");
+        std::lock_guard lock(iocpIdleMutex_);
+        iocpIdleCv_.notify_all();
+        return;
+    }
+    if (previous == 1) {
         std::lock_guard lock(iocpIdleMutex_);
         iocpIdleCv_.notify_all();
     }
+}
+
+void IocpService::AddOutstanding(IoContext& ctx,
+                                 const std::shared_ptr<IocpHandle>& handle,
+                                 SOCKET cancellationSocket) {
+    if (cancellationSocket != INVALID_SOCKET) {
+        std::lock_guard lock(pendingSocketMutex_);
+        ++pendingSockets_[cancellationSocket];
+    }
+    ctx.handlePin = handle;
+    ctx.accountingPin = handle;
+    ctx.cancellationSocket = cancellationSocket;
+    handle->AddPending();
+    outstandingIo_.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void IocpService::UnregisterPendingSocket(SOCKET cancellationSocket) {
+    if (cancellationSocket != INVALID_SOCKET) {
+        std::lock_guard lock(pendingSocketMutex_);
+        const auto it = pendingSockets_.find(cancellationSocket);
+        if (it == pendingSockets_.end() || it->second == 0) {
+            OutputDebugStringA("Missing pending socket accounting entry\n");
+        } else if (--it->second == 0) {
+            pendingSockets_.erase(it);
+        }
+    }
+}
+
+void IocpService::ReleaseOutstanding(IocpHandle& handle, SOCKET cancellationSocket) {
+    UnregisterPendingSocket(cancellationSocket);
+    handle.ReleasePending();
+    ReleaseOutstandingWithoutHandle(INVALID_SOCKET);
+}
+
+void IocpService::ReleaseOutstandingWithoutHandle(SOCKET cancellationSocket) {
+    UnregisterPendingSocket(cancellationSocket);
+    int previous = outstandingIo_.load(std::memory_order_acquire);
+    while (previous > 0 &&
+           !outstandingIo_.compare_exchange_weak(previous, previous - 1,
+                                                 std::memory_order_acq_rel,
+                                                 std::memory_order_acquire)) {
+    }
+    if (previous <= 0) {
+        OutputDebugStringA("IocpService outstanding I/O counter underflow\n");
+        return;
+    }
+    if (previous == 1) {
+        std::lock_guard lock(outstandingMutex_);
+        outstandingCv_.notify_all();
+    }
+}
+
+void IocpService::WaitOutstandingZero() const {
+    std::unique_lock lock(outstandingMutex_);
+    outstandingCv_.wait(lock, [this] {
+        return outstandingIo_.load(std::memory_order_acquire) == 0;
+    });
 }
 
 bool IocpService::PostIocpCompletion(HANDLE iocp, DWORD bytes, ULONG_PTR key, OVERLAPPED* overlapped) {
@@ -281,45 +385,40 @@ void IocpService::ClearTimers() {
     }
 
     for (std::shared_ptr<TimerState>& state : doomed) {
-        if (state->phase == TimerPhase::Pending) {
+        if (state->phase == TimerPhase::Pending ||
+            state->phase == TimerPhase::Publishing) {
             state->phase = TimerPhase::Cancelled;
-            state->handle->ReleasePending();
+            ReleaseOutstanding(*state->handle, INVALID_SOCKET);
         }
         state->ctx.reset();
     }
 }
 
-bool IocpService::EnsureConnectEx(SOCKET socketHint) {
-    LPFN_CONNECTEX fn = g_connectEx.load(std::memory_order_acquire);
-    if (fn) {
-        return true;
+void IocpService::CancelOutstandingSocketIo() {
+    std::lock_guard lock(pendingSocketMutex_);
+    for (const auto& [socket, count] : pendingSockets_) {
+        if (count == 0) {
+            continue;
+        }
+        if (!CancelIoEx(reinterpret_cast<HANDLE>(socket), nullptr)) {
+            const DWORD error = GetLastError();
+            if (error != ERROR_NOT_FOUND && error != ERROR_INVALID_HANDLE) {
+                std::string message = "CancelIoEx failed during IOCP shutdown: ";
+                message += std::to_string(error);
+                message += '\n';
+                OutputDebugStringA(message.c_str());
+            }
+        }
     }
+}
 
-    SOCKET probe = socketHint;
-    bool closeProbe = false;
-    if (probe == INVALID_SOCKET) {
-        probe = CreateTcpSocket(AF_INET);
-        closeProbe = probe != INVALID_SOCKET;
+void IocpService::WakeWorkers(HANDLE iocp, size_t count) {
+    if (!iocp) {
+        return;
     }
-    if (probe == INVALID_SOCKET) {
-        return false;
+    for (size_t i = 0; i < count; ++i) {
+        PostIocpCompletion(iocp, 0, 0, nullptr);
     }
-
-    LPFN_CONNECTEX loaded = nullptr;
-    const bool ok = LoadConnectEx(probe, &loaded);
-    if (closeProbe) {
-        closesocket(probe);
-    }
-    if (!ok || !loaded) {
-        return false;
-    }
-
-    LPFN_CONNECTEX expected = nullptr;
-    if (g_connectEx.compare_exchange_strong(expected, loaded, std::memory_order_release,
-                                           std::memory_order_acquire)) {
-        return true;
-    }
-    return g_connectEx.load(std::memory_order_acquire) != nullptr;
 }
 
 bool IocpService::Associate(SOCKET socket, const std::shared_ptr<IocpHandle>& handle) {
@@ -365,24 +464,25 @@ bool IocpService::LoadConnectEx(SOCKET socket, LPFN_CONNECTEX* outFn) {
 bool IocpService::PostRecv(SOCKET socket, IoContext* ctx, const std::shared_ptr<IocpHandle>& handle,
                            size_t offset, size_t length) {
     std::shared_lock lock(lifecycleMutex_);
-    if (!running_.load(std::memory_order_acquire) || !iocp_ || !ctx || !handle ||
+    if (!running_.load(std::memory_order_acquire) || !iocp_ || !ctx || ctx->iocpOwned ||
+        (ctx->handlePin || ctx->accountingPin) || !handle ||
         socket == INVALID_SOCKET || !ValidRecvRange(ctx->buffer, offset, length)) {
         return false;
     }
 
     const size_t recvLen = length == 0 ? ctx->buffer.size() - offset : length;
     ctx->Reset(IoOp::Recv);
-    BindContext(ctx, handle);
     ctx->socket = socket;
     ctx->wsaBuf.buf = ctx->buffer.data() + offset;
     ctx->wsaBuf.len = ToULong(recvLen);
     ctx->flags = 0;
-    handle->AddPending();
+    AddOutstanding(*ctx, handle, socket);
     DWORD recvd = 0;
     const int r = WSARecv(socket, &ctx->wsaBuf, 1, &recvd, &ctx->flags, ctx, nullptr);
     if (r == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING) {
-        handle->ReleasePending();
-        ctx->handlePin.reset();
+        ReleaseOutstanding(*handle, ctx->cancellationSocket);
+        ClearContextPins(ctx);
+        ctx->bufferPin.reset();
         return false;
     }
     return true;
@@ -399,24 +499,27 @@ bool IocpService::PostSend(SOCKET socket, IoContext* ctx, size_t offset, size_t 
 bool IocpService::PostSend(SOCKET socket, IoContext* ctx, char* data, size_t offset, size_t length,
                            const std::shared_ptr<IocpHandle>& handle) {
     std::shared_lock lock(lifecycleMutex_);
-    if (!running_.load(std::memory_order_acquire) || !iocp_ || !ctx || !handle ||
+    if (!running_.load(std::memory_order_acquire) || !iocp_ || !ctx || ctx->iocpOwned ||
+        (ctx->handlePin || ctx->accountingPin) || !handle ||
         socket == INVALID_SOCKET || !data || !ValidExternalSendRange(offset, length)) {
         return false;
     }
 
+    auto bufferPin = std::make_shared<std::vector<char>>(data + offset, data + offset + length);
     ctx->Reset(IoOp::Send);
-    BindContext(ctx, handle);
+    ctx->bufferPin = std::move(bufferPin);
     ctx->socket = socket;
     ctx->sendOffset = offset;
     ctx->sendLength = length;
-    ctx->wsaBuf.buf = data + offset;
+    ctx->wsaBuf.buf = ctx->bufferPin->data();
     ctx->wsaBuf.len = ToULong(length);
-    handle->AddPending();
+    AddOutstanding(*ctx, handle, socket);
     DWORD sent = 0;
     const int r = WSASend(socket, &ctx->wsaBuf, 1, &sent, 0, ctx, nullptr);
     if (r == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING) {
-        handle->ReleasePending();
-        ctx->handlePin.reset();
+        ReleaseOutstanding(*handle, ctx->cancellationSocket);
+        ClearContextPins(ctx);
+        ctx->bufferPin.reset();
         return false;
     }
     return true;
@@ -424,26 +527,26 @@ bool IocpService::PostSend(SOCKET socket, IoContext* ctx, char* data, size_t off
 
 bool IocpService::PostRecvFrom(SOCKET socket, IoContext* ctx, const std::shared_ptr<IocpHandle>& handle) {
     std::shared_lock lock(lifecycleMutex_);
-    if (!running_.load(std::memory_order_acquire) || !iocp_ || !ctx || !handle ||
+    if (!running_.load(std::memory_order_acquire) || !iocp_ || !ctx || ctx->iocpOwned ||
+        (ctx->handlePin || ctx->accountingPin) || !handle ||
         socket == INVALID_SOCKET || ctx->buffer.empty() || !FitsULong(ctx->buffer.size())) {
         return false;
     }
 
     ctx->Reset(IoOp::RecvFrom);
-    BindContext(ctx, handle);
     ctx->socket = socket;
     ctx->wsaBuf.buf = ctx->buffer.data();
     ctx->wsaBuf.len = ToULong(ctx->buffer.size());
     ctx->flags = 0;
     ctx->addrLen = sizeof(ctx->addr);
-    handle->AddPending();
+    AddOutstanding(*ctx, handle, socket);
     DWORD recvd = 0;
     const int r = WSARecvFrom(socket, &ctx->wsaBuf, 1, &recvd, &ctx->flags,
                               reinterpret_cast<sockaddr*>(&ctx->addr), &ctx->addrLen,
                               ctx, nullptr);
     if (r == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING) {
-        handle->ReleasePending();
-        ctx->handlePin.reset();
+        ReleaseOutstanding(*handle, ctx->cancellationSocket);
+        ClearContextPins(ctx);
         return false;
     }
     return true;
@@ -460,23 +563,31 @@ bool IocpService::PostSendTo(SOCKET socket, IoContext* ctx, size_t length,
 bool IocpService::PostSendTo(SOCKET socket, IoContext* ctx, char* data, size_t length,
                              const sockaddr* to, int toLen, const std::shared_ptr<IocpHandle>& handle) {
     std::shared_lock lock(lifecycleMutex_);
-    if (!running_.load(std::memory_order_acquire) || !iocp_ || !ctx || !handle ||
+    if (!running_.load(std::memory_order_acquire) || !iocp_ || !ctx || ctx->iocpOwned ||
+        (ctx->handlePin || ctx->accountingPin) || !handle ||
         socket == INVALID_SOCKET || !data || !to || toLen <= 0 ||
+        static_cast<size_t>(toLen) > sizeof(ctx->addr) ||
         length == 0 || !FitsULong(length)) {
         return false;
     }
 
+    auto bufferPin = std::make_shared<std::vector<char>>(data, data + length);
     ctx->Reset(IoOp::SendTo);
-    BindContext(ctx, handle);
+    ctx->bufferPin = std::move(bufferPin);
     ctx->socket = socket;
-    ctx->wsaBuf.buf = data;
+    ctx->wsaBuf.buf = ctx->bufferPin->data();
     ctx->wsaBuf.len = ToULong(length);
-    handle->AddPending();
+    std::memcpy(&ctx->addr, to, static_cast<size_t>(toLen));
+    ctx->addrLen = toLen;
+    AddOutstanding(*ctx, handle, socket);
     DWORD sent = 0;
-    const int r = WSASendTo(socket, &ctx->wsaBuf, 1, &sent, 0, to, toLen, ctx, nullptr);
+    const int r = WSASendTo(socket, &ctx->wsaBuf, 1, &sent, 0,
+                            reinterpret_cast<const sockaddr*>(&ctx->addr), ctx->addrLen,
+                            ctx, nullptr);
     if (r == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING) {
-        handle->ReleasePending();
-        ctx->handlePin.reset();
+        ReleaseOutstanding(*handle, ctx->cancellationSocket);
+        ClearContextPins(ctx);
+        ctx->bufferPin.reset();
         return false;
     }
     return true;
@@ -485,32 +596,34 @@ bool IocpService::PostSendTo(SOCKET socket, IoContext* ctx, char* data, size_t l
 bool IocpService::PostConnect(SOCKET socket, IoContext* ctx, const sockaddr* name, int namelen,
                               const std::shared_ptr<IocpHandle>& handle) {
     std::shared_lock lock(lifecycleMutex_);
-    if (!running_.load(std::memory_order_acquire) || !iocp_ || !ctx || !handle ||
+    if (!running_.load(std::memory_order_acquire) || !iocp_ || !ctx || ctx->iocpOwned ||
+        (ctx->handlePin || ctx->accountingPin) || !handle ||
         socket == INVALID_SOCKET || !name || namelen <= 0 ||
         static_cast<size_t>(namelen) > sizeof(ctx->addr)) {
         return false;
     }
-    if (!EnsureConnectEx(socket)) {
+    const int family = name->sa_family;
+    if ((family != AF_INET && family != AF_INET6) ||
+        !IsBoundForConnectEx(socket, family)) {
         return false;
     }
 
-    const LPFN_CONNECTEX connectFn = g_connectEx.load(std::memory_order_acquire);
-    if (!connectFn) {
+    LPFN_CONNECTEX connectFn = nullptr;
+    if (!LoadConnectEx(socket, &connectFn) || !connectFn) {
         return false;
     }
 
     ctx->Reset(IoOp::Connect);
-    BindContext(ctx, handle);
     ctx->socket = socket;
     std::memcpy(&ctx->addr, name, static_cast<size_t>(namelen));
     ctx->addrLen = namelen;
-    handle->AddPending();
+    AddOutstanding(*ctx, handle, socket);
     DWORD bytesSent = 0;
     const BOOL ok = connectFn(socket, reinterpret_cast<const sockaddr*>(&ctx->addr),
                               ctx->addrLen, nullptr, 0, &bytesSent, ctx);
     if (!ok && WSAGetLastError() != WSA_IO_PENDING) {
-        handle->ReleasePending();
-        ctx->handlePin.reset();
+        ReleaseOutstanding(*handle, ctx->cancellationSocket);
+        ClearContextPins(ctx);
         return false;
     }
     return true;
@@ -529,23 +642,25 @@ bool IocpService::PostAccept(SOCKET listenSocket, SOCKET acceptSocket, IoContext
                              char* addrBuf, DWORD addrBufLen, const std::shared_ptr<IocpHandle>& handle,
                              LPFN_ACCEPTEX acceptEx) {
     std::shared_lock lock(lifecycleMutex_);
-    if (!running_.load(std::memory_order_acquire) || !iocp_ || !ctx || !handle || !acceptEx ||
+    if (!running_.load(std::memory_order_acquire) || !iocp_ || !ctx || ctx->iocpOwned ||
+        (ctx->handlePin || ctx->accountingPin) ||
+        !handle || !acceptEx ||
         listenSocket == INVALID_SOCKET || acceptSocket == INVALID_SOCKET ||
+        ctx->buffer.data() != addrBuf || ctx->buffer.size() < addrBufLen ||
         !ValidAcceptExAddrBuf(addrBuf, addrBufLen)) {
         return false;
     }
 
     ctx->Reset(IoOp::Accept);
-    BindContext(ctx, handle);
     ctx->socket = acceptSocket;
-    handle->AddPending();
+    AddOutstanding(*ctx, handle, listenSocket);
     DWORD bytes = 0;
     const BOOL ok = acceptEx(listenSocket, acceptSocket, addrBuf, 0,
                              addrBufLen / 2, addrBufLen / 2,
                              &bytes, ctx);
     if (!ok && WSAGetLastError() != WSA_IO_PENDING) {
-        handle->ReleasePending();
-        ctx->handlePin.reset();
+        ReleaseOutstanding(*handle, ctx->cancellationSocket);
+        ClearContextPins(ctx);
         return false;
     }
     return true;
@@ -553,17 +668,17 @@ bool IocpService::PostAccept(SOCKET listenSocket, SOCKET acceptSocket, IoContext
 
 bool IocpService::PostUser(const std::shared_ptr<IocpHandle>& handle, IoContext* ctx, uint64_t userKey) {
     std::shared_lock lock(lifecycleMutex_);
-    if (!running_.load(std::memory_order_acquire) || !iocp_ || !handle || !ctx) {
+    if (!running_.load(std::memory_order_acquire) || !iocp_ || !handle || !ctx ||
+        ctx->iocpOwned || ctx->handlePin || ctx->accountingPin) {
         return false;
     }
 
     ctx->Reset(IoOp::User);
     ctx->userKey = userKey;
-    BindContext(ctx, handle);
-    handle->AddPending();
+    AddOutstanding(*ctx, handle);
     if (!PostIocpCompletion(iocp_, 0, reinterpret_cast<ULONG_PTR>(handle.get()), ctx)) {
-        handle->ReleasePending();
-        ctx->handlePin.reset();
+        ReleaseOutstanding(*handle, ctx->cancellationSocket);
+        ClearContextPins(ctx);
         return false;
     }
     return true;
@@ -581,31 +696,37 @@ IocpService::TimerId IocpService::ScheduleTimeout(const std::shared_ptr<IocpHand
     state->ctx->userKey = userKey;
     state->ctx->iocpOwned = true;
     state->handle = handle;
-    state->id = nextTimerId_.fetch_add(1);
-    if (state->id == 0) {
-        state->id = nextTimerId_.fetch_add(1);
-    }
     state->due = std::chrono::steady_clock::now() + std::chrono::milliseconds(delayMs);
-    state->phase = TimerPhase::Pending;
+    state->phase = TimerPhase::Publishing;
 
-    handle->AddPending();
+    AddOutstanding(*state->ctx, handle);
+    try {
+        std::lock_guard lock(timerMutex_);
+        do {
+            state->id = nextTimerId_.fetch_add(1, std::memory_order_relaxed);
+        } while (state->id == 0 || timers_.contains(state->id));
 
+        timers_.emplace(state->id, state);
+    } catch (...) {
+        ReleaseOutstanding(*handle, INVALID_SOCKET);
+        ClearContextPins(state->ctx.get());
+        return 0;
+    }
+
+    const bool scheduled = PostIocpCompletion(iocp_, 0, 0, nullptr);
     {
         std::lock_guard lock(timerMutex_);
-        timers_.emplace(state->id, state);
-    }
-
-    const HANDLE iocp = iocp_;
-    if (!iocp || !PostIocpCompletion(iocp, 0, 0, nullptr)) {
-        std::lock_guard lock(timerMutex_);
-        const auto it = timers_.find(state->id);
-        if (it != timers_.end() && it->second->phase == TimerPhase::Pending) {
-            it->second->phase = TimerPhase::Cancelled;
-            timers_.erase(it);
-            handle->ReleasePending();
-            return 0;
+        if (!scheduled) {
+            state->phase = TimerPhase::Cancelled;
+            timers_.erase(state->id);
+        } else {
+            state->phase = TimerPhase::Pending;
         }
-        // Timer already claimed by AdvanceTimers(); completion is already scheduled.
+    }
+    if (!scheduled) {
+        OutputDebugStringA("Failed to wake IOCP worker for a scheduled timer\n");
+        ReleaseOutstanding(*handle, INVALID_SOCKET);
+        return 0;
     }
 
     return state->id;
@@ -631,8 +752,13 @@ void IocpService::CancelTimeout(TimerId id) {
         timers_.erase(it);
     }
 
-    state->handle->ReleasePending();
+    ReleaseOutstanding(*state->handle, INVALID_SOCKET);
     state->ctx.reset();
+
+    IocpLease iocpLease(*this);
+    if (iocpLease) {
+        PostIocpCompletion(iocpLease.get(), 0, 0, nullptr);
+    }
 }
 
 DWORD IocpService::AdvanceTimers() {
@@ -649,13 +775,12 @@ DWORD IocpService::AdvanceTimers() {
 
         for (std::unordered_map<TimerId, std::shared_ptr<TimerState>>::iterator it = timers_.begin();
              it != timers_.end();) {
-            if (it->second->due <= now) {
+            if (it->second->due <= now &&
+                it->second->phase == TimerPhase::Pending) {
                 std::shared_ptr<TimerState>& state = it->second;
-                if (state->phase == TimerPhase::Pending) {
-                    state->phase = TimerPhase::Claimed;
-                    state->ctx->handlePin = state->handle;
-                    claimed.push_back(ClaimedTimer{state->handle, state->ctx.release()});
-                }
+                state->phase = TimerPhase::Claimed;
+                state->ctx->handlePin = state->handle;
+                claimed.push_back(ClaimedTimer{state->handle, state->ctx.release()});
                 it = timers_.erase(it);
             } else {
                 ++it;
@@ -686,25 +811,36 @@ DWORD IocpService::AdvanceTimers() {
         }
     }
 
-    if (!running_.load(std::memory_order_acquire)) {
-        std::vector<IoContext*> orphaned;
-        orphaned.reserve(claimed.size());
-        for (ClaimedTimer& item : claimed) {
-            orphaned.push_back(item.ctx);
+    const auto discardClaimed = [this](ClaimedTimer& item) {
+        if (!item.ctx) {
+            return;
         }
-        CleanupClaimedContexts(orphaned);
+        std::shared_ptr<IocpHandle> accounting =
+            item.ctx->handlePin ? item.ctx->handlePin : item.ctx->accountingPin;
+        if (accounting) {
+            ReleaseOutstanding(*accounting, item.ctx->cancellationSocket);
+        } else {
+            ReleaseOutstandingWithoutHandle(item.ctx->cancellationSocket);
+        }
+        if (item.ctx->iocpOwned) {
+            delete item.ctx;
+        }
+        item.ctx = nullptr;
+    };
+
+    if (!running_.load(std::memory_order_acquire)) {
+        for (ClaimedTimer& item : claimed) {
+            discardClaimed(item);
+        }
         return 0;
     }
 
     {
         IocpLease iocpLease(*this);
         if (!iocpLease) {
-            std::vector<IoContext*> orphaned;
-            orphaned.reserve(claimed.size());
             for (ClaimedTimer& item : claimed) {
-                orphaned.push_back(item.ctx);
+                discardClaimed(item);
             }
-            CleanupClaimedContexts(orphaned);
             return waitMs;
         }
 
@@ -712,12 +848,7 @@ DWORD IocpService::AdvanceTimers() {
             if (!PostIocpCompletion(iocpLease.get(), 0,
                                     reinterpret_cast<ULONG_PTR>(item.handle.get()),
                                     item.ctx)) {
-                if (item.ctx->handlePin) {
-                    item.ctx->handlePin->ReleasePending();
-                }
-                if (item.ctx->iocpOwned) {
-                    delete item.ctx;
-                }
+                discardClaimed(item);
             }
         }
     }
@@ -726,9 +857,13 @@ DWORD IocpService::AdvanceTimers() {
 }
 
 void IocpService::WorkerLoop() {
+    IocpService* previousWorkerService = g_currentIocpWorker;
+    g_currentIocpWorker = this;
     while (true) {
         const bool running = running_.load(std::memory_order_acquire);
-        const DWORD waitMs = running ? AdvanceTimers() : 0;
+        const bool shutdownComplete =
+            !running && outstandingIo_.load(std::memory_order_acquire) == 0;
+        const DWORD waitMs = running ? AdvanceTimers() : (shutdownComplete ? 0 : INFINITE);
 
         DWORD bytes = 0;
         ULONG_PTR key = 0;
@@ -748,19 +883,26 @@ void IocpService::WorkerLoop() {
 
         if (!ok && overlapped == nullptr) {
             if (gqcsError == WAIT_TIMEOUT) {
-                if (!running_.load(std::memory_order_acquire)) {
+                if (!running_.load(std::memory_order_acquire) &&
+                    outstandingIo_.load(std::memory_order_acquire) == 0) {
                     break;
                 }
                 continue;
             }
-            if (!running_.load(std::memory_order_acquire)) {
+            if (!running_.load(std::memory_order_acquire) &&
+                outstandingIo_.load(std::memory_order_acquire) == 0) {
                 break;
             }
-            continue;
+            std::string message = "GetQueuedCompletionStatus failed without OVERLAPPED: ";
+            message += std::to_string(gqcsError);
+            message += '\n';
+            OutputDebugStringA(message.c_str());
+            break;
         }
 
         if (overlapped == nullptr && key == 0) {
-            if (!running_.load(std::memory_order_acquire)) {
+            if (!running_.load(std::memory_order_acquire) &&
+                outstandingIo_.load(std::memory_order_acquire) == 0) {
                 break;
             }
             continue;
@@ -772,26 +914,55 @@ void IocpService::WorkerLoop() {
         }
 
         const bool iocpOwned = ctx->iocpOwned;
+        const SOCKET cancellationSocket = ctx->cancellationSocket;
         std::shared_ptr<IocpHandle> pin = std::move(ctx->handlePin);
+        std::shared_ptr<IocpHandle> accountingPin = std::move(ctx->accountingPin);
+        UnregisterPendingSocket(cancellationSocket);
         if (!pin) {
+            pin = std::move(accountingPin);
+        } else {
+            accountingPin.reset();
+        }
+        if (!pin) {
+            OutputDebugStringA("IOCP completion arrived without either lifetime pin\n");
+            ReleaseOutstandingWithoutHandle(INVALID_SOCKET);
             if (iocpOwned) {
                 delete ctx;
             }
             continue;
         }
 
+        DWORD completionError = ok ? ERROR_SUCCESS : gqcsError;
         {
             std::lock_guard completionLock(pin->completionMutex_);
+            if (completionError == ERROR_SUCCESS && ctx->op == IoOp::Connect) {
+                if (setsockopt(ctx->socket, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT,
+                               nullptr, 0) != 0) {
+                    completionError = static_cast<DWORD>(WSAGetLastError());
+                }
+            } else if (completionError == ERROR_SUCCESS && ctx->op == IoOp::Accept) {
+                if (setsockopt(ctx->socket, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
+                               reinterpret_cast<const char*>(&cancellationSocket),
+                               sizeof(cancellationSocket)) != 0) {
+                    completionError = static_cast<DWORD>(WSAGetLastError());
+                }
+            }
             try {
-                pin->OnIoCompleted(bytes, ok ? ERROR_SUCCESS : gqcsError, ctx);
+                pin->OnIoCompleted(bytes, completionError, ctx);
+            } catch (const std::exception& ex) {
+                std::string message = "Exception escaped OnIoCompleted: ";
+                message += ex.what();
+                message += '\n';
+                OutputDebugStringA(message.c_str());
             } catch (...) {
-                // A completion target must not terminate the IOCP worker or skip accounting.
+                OutputDebugStringA("Unknown exception escaped OnIoCompleted\n");
             }
         }
 
         if (iocpOwned) {
             delete ctx;
         }
-        pin->ReleasePending();
+        ReleaseOutstanding(*pin, INVALID_SOCKET);
     }
+    g_currentIocpWorker = previousWorkerService;
 }

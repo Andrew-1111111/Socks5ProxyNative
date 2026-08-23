@@ -63,7 +63,7 @@ bool TcpAcceptor::PostAccept(AcceptIo& io) {
     }
 
     if (!iocp_.PostAccept(listenSocket_, io.acceptSocket, &io.ctx,
-                          io.addrBuf, static_cast<DWORD>(sizeof(io.addrBuf)),
+                          io.ctx.buffer.data(), static_cast<DWORD>(io.ctx.buffer.size()),
                           shared_from_this(), acceptEx_)) {
         closesocket(io.acceptSocket);
         io.acceptSocket = INVALID_SOCKET;
@@ -101,16 +101,6 @@ void TcpAcceptor::HandleAccept(AcceptIo& io, DWORD error) {
         if (client != INVALID_SOCKET) closesocket(client);
         if (!stopping_ && !PostAccept(io)) {
             Logger::Instance().Error("Failed to repost AcceptEx after an accept error.");
-        }
-        return;
-    }
-
-    // Required after AcceptEx
-    if (setsockopt(client, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
-                   reinterpret_cast<const char*>(&listenSocket_), sizeof(listenSocket_)) != 0) {
-        closesocket(client);
-        if (!stopping_ && !PostAccept(io)) {
-            Logger::Instance().Error("Failed to repost AcceptEx after updating accept context.");
         }
         return;
     }
