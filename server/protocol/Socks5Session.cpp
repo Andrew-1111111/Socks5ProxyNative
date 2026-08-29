@@ -31,15 +31,15 @@ constexpr size_t kGssRelayChunk = 16 * 1024;
 std::string DescribeNonSocks5FirstByte(uint8_t b) {
     switch (b) {
     case 'C':
-        return "Looks like HTTP CONNECT — the client may be configured for HTTP/HTTPS proxy instead of SOCKS5.";
+        return "Looks like HTTP CONNECT: the client may be configured for HTTP/HTTPS proxy instead of SOCKS5.";
     case 'G':
-        return "Looks like HTTP GET — the client may be configured for HTTP proxy instead of SOCKS5.";
+        return "Looks like HTTP GET: the client may be configured for HTTP proxy instead of SOCKS5.";
     case 'H':
-        return "Looks like HTTP HEAD — the client may be configured for HTTP proxy instead of SOCKS5.";
+        return "Looks like HTTP HEAD: the client may be configured for HTTP proxy instead of SOCKS5.";
     case 'P':
-        return "Looks like HTTP POST — the client may be configured for HTTP proxy instead of SOCKS5.";
+        return "Looks like HTTP POST: the client may be configured for HTTP proxy instead of SOCKS5.";
     case 0x16:
-        return "Looks like TLS ClientHello — the client sent HTTPS traffic directly to the SOCKS5 port.";
+        return "Looks like TLS ClientHello: the client sent HTTPS traffic directly to the SOCKS5 port.";
     default:
         if (b >= 32 && b < 127) {
             return std::string("Expected SOCKS5 handshake (first byte 0x05), got ASCII '") +
