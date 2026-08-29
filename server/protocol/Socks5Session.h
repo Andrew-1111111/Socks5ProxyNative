@@ -3,11 +3,8 @@
 #include "../../dns/DnsResolver.h"
 #include "GssapiContext.h"
 #include "UdpRelay.h"
-#include "../../friendly/FriendlyNameResolver.h"
-#include "../../network/Iocp.h"
 
 #include <atomic>
-#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <memory>

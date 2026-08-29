@@ -1,26 +1,10 @@
 #include "Iocp.h"
 
-#include <WinSock2.h>
-#include <Windows.h>
-#include <ws2def.h>
-#include <ws2ipdef.h>
-#include <MSWSock.h>
-
-#include <atomic>
-#include <chrono>
 #include <climits>
-#include <cstdint>
 #include <cstring>
 #include <exception>
 #include <limits>
-#include <memory>
-#include <mutex>
-#include <shared_mutex>
-#include <string>
-#include <thread>
-#include <unordered_map>
 #include <utility>
-#include <vector>
 
 namespace {
 

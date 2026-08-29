@@ -4,11 +4,6 @@
 #include "../dns/DnsResolver.h"
 #include "Iocp.h"
 
-#include <WinSock2.h>
-#include <ws2def.h>
-#include <ws2ipdef.h>
-#include <WS2tcpip.h>
-#include <windows.h>
 #include <iphlpapi.h>
 #include <IPTypes.h>
 #include <ifdef.h>
@@ -16,14 +11,9 @@
 
 #include <cctype>
 #include <chrono>
-#include <cstdint>
 #include <cstring>
 #include <future>
-#include <memory>
-#include <optional>
-#include <string>
 #include <thread>
-#include <vector>
 
 #pragma comment(lib, "iphlpapi.lib")
 

@@ -4,7 +4,6 @@
 #include "../network/Iocp.h"
 
 #include <atomic>
-#include <cstddef>
 #include <deque>
 #include <functional>
 #include <list>

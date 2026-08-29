@@ -3,24 +3,13 @@
 #include "../ProxyServer.h"
 #include "Socks5Constants.h"
 #include "../../config/NetworkConfiguration.h"
-#include "../../network/Network.h"
 #include "../../utils/Logger.h"
 
-#include <WinSock2.h>
-#include <WS2tcpip.h>
 #include <mstcpip.h>
 
 #include <algorithm>
-#include <cstddef>
-#include <cstdint>
 #include <cstring>
-#include <memory>
-#include <mutex>
-#include <optional>
-#include <string>
 #include <string_view>
-#include <utility>
-#include <vector>
 
 namespace {
 constexpr size_t kProtoBuf = 4096;
@@ -174,7 +163,7 @@ void Socks5Session::Close() {
     Logger::Instance().Info("Connection closed for client {ClientEndPoint}{Friendly}.", ep, friendly);
 
     if (udpRelay_) {
-        auto relay = std::move(udpRelay_);
+        std::shared_ptr<UdpRelay> relay = std::move(udpRelay_);
         relay->Stop(false);
         relay->WaitPendingZero(-1);
     }
@@ -658,7 +647,8 @@ int Socks5Session::TryReadGssFrame(uint8_t expectedMtyp, std::vector<uint8_t>& t
     }
     if (mtyp != expectedMtyp) return -1;
     if (!ReadExactAvailable(4)) return 0;
-    const size_t len = (static_cast<uint8_t>(ingest_[2]) << 8) | static_cast<uint8_t>(ingest_[3]);
+    const size_t len = (static_cast<size_t>(static_cast<uint8_t>(ingest_[2])) << 8) |
+                       static_cast<size_t>(static_cast<uint8_t>(ingest_[3]));
     if (!ReadExactAvailable(4 + len)) return 0;
     token.assign(reinterpret_cast<uint8_t*>(ingest_.data() + 4),
                  reinterpret_cast<uint8_t*>(ingest_.data() + 4 + len));
@@ -749,13 +739,13 @@ bool Socks5Session::ProcessHandshakeBuffer() {
     }
     const uint8_t methodCount = static_cast<uint8_t>(ingest_[1]);
     if (methodCount == 0) return false;
-    if (!ReadExactAvailable(2u + methodCount)) return true;
+    if (!ReadExactAvailable(static_cast<size_t>(2) + static_cast<size_t>(methodCount))) return true;
 
     bool offerGss = false;
     bool offerUserPass = false;
     bool offerNoAuth = false;
     for (uint8_t i = 0; i < methodCount; ++i) {
-        const uint8_t m = static_cast<uint8_t>(ingest_[2 + i]);
+        const uint8_t m = static_cast<uint8_t>(ingest_[static_cast<size_t>(2) + static_cast<size_t>(i)]);
         if (m == socks5::AuthMethod::Gssapi) offerGss = true;
         else if (m == socks5::AuthMethod::UsernamePassword) offerUserPass = true;
         else if (m == socks5::AuthMethod::NoAuth) offerNoAuth = true;
@@ -801,15 +791,18 @@ bool Socks5Session::ProcessAuthBuffer() {
     if (!ReadExactAvailable(2)) return true;
     if (static_cast<uint8_t>(ingest_[0]) != socks5::AuthProtocol::Version) return false;
     const uint8_t ulen = static_cast<uint8_t>(ingest_[1]);
-    if (!ReadExactAvailable(2u + ulen + 1u)) return true;
-    const uint8_t plen = static_cast<uint8_t>(ingest_[2 + ulen]);
-    if (!ReadExactAvailable(2u + ulen + 1u + plen)) return true;
+    const size_t ulenSize = static_cast<size_t>(ulen);
+    if (!ReadExactAvailable(static_cast<size_t>(2) + ulenSize + 1)) return true;
+    const uint8_t plen = static_cast<uint8_t>(ingest_[static_cast<size_t>(2) + ulenSize]);
+    const size_t plenSize = static_cast<size_t>(plen);
+    if (!ReadExactAvailable(static_cast<size_t>(2) + ulenSize + 1 + plenSize)) return true;
 
     const std::string username(ingest_.data() + 2, ulen);
-    const std::string password(ingest_.data() + 3 + ulen, plen);
-    ingest_.erase(ingest_.begin(), ingest_.begin() + static_cast<std::ptrdiff_t>(2u + ulen + 1u + plen));
+    const std::string password(ingest_.data() + 3 + ulenSize, plen);
+    ingest_.erase(ingest_.begin(),
+                  ingest_.begin() + static_cast<std::ptrdiff_t>(static_cast<size_t>(2) + ulenSize + 1 + plenSize));
 
-    const bool ok = ConstantTimeEqual(username, NetworkConfiguration::Username) &
+    const bool ok = ConstantTimeEqual(username, NetworkConfiguration::Username) &&
                     ConstantTimeEqual(password, NetworkConfiguration::Password);
     QueueClientSendRaw({static_cast<char>(socks5::AuthProtocol::Version),
                         static_cast<char>(ok ? socks5::AuthProtocol::Success
@@ -962,11 +955,13 @@ bool Socks5Session::ProcessRequestBuffer() {
             FailAndClose(socks5::ReplyCode::AddressTypeNotSupported);
             return true;
         }
-        need = 5u + dlen + 2u;
+        const size_t dlenSize = static_cast<size_t>(dlen);
+        need = static_cast<size_t>(5) + dlenSize + static_cast<size_t>(2);
         if (!ReadExactAvailable(need)) return true;
         address.assign(ingest_.data() + 5, dlen);
-        port = static_cast<uint16_t>((static_cast<uint8_t>(ingest_[5 + dlen]) << 8) |
-                                     static_cast<uint8_t>(ingest_[6 + dlen]));
+        const size_t portOffset = static_cast<size_t>(5) + dlenSize;
+        port = static_cast<uint16_t>((static_cast<uint16_t>(static_cast<uint8_t>(ingest_[portOffset])) << 8) |
+                                     static_cast<uint8_t>(ingest_[portOffset + 1]));
     } else {
         FailAndClose(socks5::ReplyCode::AddressTypeNotSupported);
         return true;

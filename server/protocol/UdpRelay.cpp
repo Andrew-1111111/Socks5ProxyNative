@@ -2,33 +2,22 @@
 
 #include "Socks5Constants.h"
 #include "../../config/NetworkConfiguration.h"
-#include "../../network/Network.h"
 #include "../../utils/Logger.h"
 
-#include <WinSock2.h>
-
-#include <chrono>
-#include <cstdint>
-#include <cstring>
 #include <exception>
-#include <memory>
-#include <mutex>
-#include <optional>
-#include <string>
-#include <utility>
-#include <vector>
+#include <cstring>
 
 namespace {
 constexpr auto kCleanupInterval = std::chrono::seconds(10);
 constexpr auto kFragReassemblyTimeout = std::chrono::seconds(5);
 constexpr size_t kMaxAssembledUdpPayload = 65535;
-}
 
-std::chrono::milliseconds UdpIdleTimeout() {
+static std::chrono::milliseconds UdpIdleTimeout() {
     const int ms = NetworkConfiguration::UdpAssociateIdleTimeoutMs > 0
                        ? NetworkConfiguration::UdpAssociateIdleTimeoutMs
                        : 120'000;
     return std::chrono::milliseconds(ms);
+}
 }
 
 UdpRelay::UdpRelay(IocpService& iocp,
@@ -166,7 +155,7 @@ void UdpRelay::Stop(bool notifySession) {
         dnsInFlight_.clear();
     }
     if (notifySession && onStopped_) {
-        auto cb = std::move(onStopped_);
+        StopCallback cb = std::move(onStopped_);
         onStopped_ = nullptr;
         cb();
     }
@@ -287,7 +276,7 @@ void UdpRelay::EnqueueSendLocked(std::vector<char> data, const sockaddr_storage&
         Logger::Instance().Warning("UDP send queue limit reached; dropping datagram.");
         return;
     }
-    auto out = std::make_unique<Outbound>();
+    std::unique_ptr<Outbound> out = std::make_unique<Outbound>();
     out->data = std::move(data);
     out->to = to;
     out->toLen = to.ss_family == AF_INET ? sizeof(sockaddr_in) : sizeof(sockaddr_in6);
@@ -298,7 +287,7 @@ void UdpRelay::EnqueueSendLocked(std::vector<char> data, const sockaddr_storage&
 void UdpRelay::PumpSendLocked() {
     while (sendsInFlight_ < kMaxUdpSendsInFlight && !pendingSends_.empty() &&
            !stop_ && udpSocket_ != INVALID_SOCKET) {
-        auto out = std::move(pendingSends_.front());
+        std::unique_ptr<Outbound> out = std::move(pendingSends_.front());
         pendingSends_.pop_front();
         Outbound* raw = out.get();
         if (!iocp_.PostSendTo(udpSocket_, &raw->ctx, raw->data.data(), raw->data.size(),

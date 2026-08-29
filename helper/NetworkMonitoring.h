@@ -2,7 +2,6 @@
 
 #include <atomic>
 #include <string>
-#include <thread>
 
 class NetworkMonitoring {
 public:

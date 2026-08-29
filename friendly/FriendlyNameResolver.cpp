@@ -3,11 +3,6 @@
 #include "../network/Network.h"
 #include "../utils/Logger.h"
 
-#include <WinSock2.h>
-
-#include <string>
-#include <vector>
-
 FriendlyNameResolver::FriendlyNameResolver(const std::vector<IPAddressMapping>& mappings) {
     int invalid = 0;
     int duplicates = 0;

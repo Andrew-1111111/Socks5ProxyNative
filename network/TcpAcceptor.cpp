@@ -1,14 +1,7 @@
 #include "TcpAcceptor.h"
 
-#include "Iocp.h"
 #include "../utils/Logger.h"
 
-#include <WinSock2.h>
-#include <Windows.h>
-#include <MSWSock.h>
-
-#include <memory>
-#include <mutex>
 #include <utility>
 
 TcpAcceptor::TcpAcceptor(IocpService& iocp, SOCKET listenSocket, int family, AcceptCallback onAccept)

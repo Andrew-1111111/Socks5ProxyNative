@@ -5,18 +5,10 @@
 #include "../network/Network.h"
 #include "../utils/Logger.h"
 
-#include <WinSock2.h>
-#include <Windows.h>
-
-#include <atomic>
 #include <chrono>
 #include <exception>
-#include <memory>
-#include <mutex>
-#include <semaphore>
 #include <stdexcept>
 #include <thread>
-#include <vector>
 
 ProxyServer::ProxyServer(FriendlyNameResolver& resolver)
     : resolver_(resolver) {}

@@ -2,15 +2,8 @@
 
 #include "../../utils/Logger.h"
 
-#include <Windows.h>
-#include <sspi.h>
-
-#include <cstddef>
-#include <cstdint>
 #include <cstring>
 #include <limits>
-#include <string>
-#include <vector>
 
 #pragma comment(lib, "secur32.lib")
 
@@ -220,13 +213,14 @@ bool GssapiContext::Wrap(const uint8_t* input, size_t inputLen, bool confidentia
         return false;
     }
 
-    output.reserve(bufs[0].cbBuffer + bufs[1].cbBuffer + bufs[2].cbBuffer);
+    output.reserve(static_cast<size_t>(bufs[0].cbBuffer) + static_cast<size_t>(bufs[1].cbBuffer) +
+                   static_cast<size_t>(bufs[2].cbBuffer));
     output.insert(output.end(), static_cast<uint8_t*>(bufs[0].pvBuffer),
-                  static_cast<uint8_t*>(bufs[0].pvBuffer) + bufs[0].cbBuffer);
+                  static_cast<uint8_t*>(bufs[0].pvBuffer) + static_cast<size_t>(bufs[0].cbBuffer));
     output.insert(output.end(), static_cast<uint8_t*>(bufs[1].pvBuffer),
-                  static_cast<uint8_t*>(bufs[1].pvBuffer) + bufs[1].cbBuffer);
+                  static_cast<uint8_t*>(bufs[1].pvBuffer) + static_cast<size_t>(bufs[1].cbBuffer));
     output.insert(output.end(), static_cast<uint8_t*>(bufs[2].pvBuffer),
-                  static_cast<uint8_t*>(bufs[2].pvBuffer) + bufs[2].cbBuffer);
+                  static_cast<uint8_t*>(bufs[2].pvBuffer) + static_cast<size_t>(bufs[2].cbBuffer));
     return true;
 }
 

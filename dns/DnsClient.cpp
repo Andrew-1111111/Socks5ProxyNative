@@ -3,14 +3,9 @@
 #include <chrono>
 #include <climits>
 #include <cctype>
-#include <cstdint>
-#include <mutex>
-#include <optional>
 #include <random>
 #include <sstream>
 #include <stdexcept>
-#include <string>
-#include <vector>
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN

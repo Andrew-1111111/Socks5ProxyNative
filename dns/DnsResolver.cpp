@@ -4,19 +4,9 @@
 #include "../network/Network.h"
 #include "../utils/Logger.h"
 
-#include <WinSock2.h>
-#include <Windows.h>
-
 #include <cctype>
-#include <cstdint>
 #include <cstring>
-#include <memory>
-#include <mutex>
-#include <optional>
 #include <stdexcept>
-#include <string>
-#include <utility>
-#include <vector>
 
 namespace {
 
@@ -344,7 +334,7 @@ void DnsResolver::Stop() {
 
     std::vector<std::shared_ptr<TcpDnsQuery>> tcpPins;
     for (auto& q : pending) {
-        for (auto& cb : q->callbacks) {
+        for (Callback& cb : q->callbacks) {
             if (cb) cb(std::nullopt);
         }
         q->callbacks.clear();
@@ -454,8 +444,8 @@ void DnsResolver::BeginUdpQueryLocked(std::shared_ptr<PendingQuery> pending) {
     } catch (...) {
         byId_.erase(pending->txid);
         byDomain_.erase(pending->domain);
-        auto cbs = std::move(pending->callbacks);
-        for (auto& cb : cbs) {
+        std::vector<Callback> cbs = std::move(pending->callbacks);
+        for (Callback& cb : cbs) {
             if (cb) cb(std::nullopt);
         }
     }
@@ -473,7 +463,7 @@ void DnsResolver::EnqueueUdpSendLocked(std::vector<uint8_t> query) {
     if (udpSocket_ == INVALID_SOCKET || pendingSends_.size() >= kMaxPendingSends) {
         return;
     }
-    auto out = std::make_unique<Outbound>();
+    std::unique_ptr<Outbound> out = std::make_unique<Outbound>();
     out->data.assign(reinterpret_cast<const char*>(query.data()),
                      reinterpret_cast<const char*>(query.data()) + query.size());
     out->to = dnsAddr_;
@@ -485,7 +475,7 @@ void DnsResolver::EnqueueUdpSendLocked(std::vector<uint8_t> query) {
 void DnsResolver::PumpSendLocked() {
     while (sendsInFlight_ < kMaxDnsSendsInFlight && !pendingSends_.empty() &&
            udpSocket_ != INVALID_SOCKET && !stopping_) {
-        auto out = std::move(pendingSends_.front());
+        std::unique_ptr<Outbound> out = std::move(pendingSends_.front());
         pendingSends_.pop_front();
         Outbound* raw = out.get();
         if (!iocp_.PostSendTo(udpSocket_, &raw->ctx, raw->data.data(), raw->data.size(),
@@ -747,7 +737,7 @@ void DnsResolver::FinishQuery(std::shared_ptr<PendingQuery> pending, const DnsCl
     if (useCache) {
         client_.Cache(pending->domain, result);
     }
-    for (auto& cb : callbacks) {
+    for (Callback& cb : callbacks) {
         if (cb) cb(result.address);
     }
 }

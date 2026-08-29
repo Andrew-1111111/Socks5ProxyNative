@@ -1,14 +1,13 @@
 ﻿#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
-#include <winsock2.h>
+#include "network/Network.h"
 #include <windows.h>
 
 #include "config/NetworkConfiguration.h"
 #include "config/ProxyConfiguration.h"
 #include "friendly/FriendlyNameResolver.h"
 #include "helper/NetworkMonitoring.h"
-#include "network/Network.h"
 #include "server/ProxyServer.h"
 #include "utils/Application.h"
 #include "utils/Logger.h"

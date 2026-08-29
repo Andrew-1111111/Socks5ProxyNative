@@ -2,7 +2,6 @@
 
 #include "../dns/DnsResolver.h"
 #include "../friendly/FriendlyNameResolver.h"
-#include "../network/Iocp.h"
 #include "../network/TcpAcceptor.h"
 
 #include <atomic>

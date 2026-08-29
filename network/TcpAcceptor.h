@@ -2,11 +2,7 @@
 
 #include "Iocp.h"
 
-#include <cstddef>
 #include <functional>
-#include <memory>
-#include <vector>
-#include <atomic>
 
 /// Overlapped AcceptEx acceptor bound to an IOCP service.
 class TcpAcceptor : public IocpHandle {
