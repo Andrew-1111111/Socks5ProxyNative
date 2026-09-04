@@ -1,13 +1,12 @@
 ﻿#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
-#include "network/Network.h"
-#include <windows.h>
 
 #include "config/NetworkConfiguration.h"
 #include "config/ProxyConfiguration.h"
 #include "friendly/FriendlyNameResolver.h"
 #include "helper/NetworkMonitoring.h"
+#include "network/Network.h"
 #include "server/ProxyServer.h"
 #include "utils/Application.h"
 #include "utils/Logger.h"
@@ -19,6 +18,7 @@
 #include <iostream>
 #include <string>
 #include <thread>
+#include <windows.h>
 #include <WinSock2.h>
 
 #pragma comment(lib, "ws2_32.lib")
@@ -98,10 +98,12 @@ int main(int argc, char* argv[]) {
 
         if (!proxyConfig.IsValid(error)) {
             Logger::Instance().Error("Invalid proxy configuration: {Error}", error);
-            PauseOnErrorIfStandaloneConsole();
-            WSACleanup();
-            return 2;
-        }
+            SetConsoleCtrlHandler(ConsoleHandler, TRUE);
+            NetworkMonitoring monitoring;
+            monitoring.PrepareRestartAfterDelay(NetworkMonitoring::StartupRestartDelaySec, g_stop);
+            restartAfterCleanup = monitoring.RestartRequested();
+            exitCode = 0;
+        } else {
         if (!NetworkConfiguration::HasCredentials() &&
             !NetworkConfiguration::EnableGssapi &&
             NetworkUtils::IsAnyAddress(NetworkConfiguration::ListenIPAddress)) {
@@ -109,7 +111,12 @@ int main(int argc, char* argv[]) {
                 "Proxy is listening on all interfaces without authentication.");
         }
         if (proxyConfig.RunDelayS > 0) {
-            std::this_thread::sleep_for(std::chrono::seconds(proxyConfig.RunDelayS));
+            Logger::Instance().Info("Startup delay enabled: waiting {Seconds} seconds before starting the server.",
+                                    proxyConfig.RunDelayS);
+            for (int remaining = proxyConfig.RunDelayS; remaining > 0; --remaining) {
+                Logger::Instance().Info("Startup delay: {Remaining} seconds remaining.", remaining);
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
         }
 
         Logger::Instance().Info("Proxy configuration loaded successfully");
@@ -156,22 +163,35 @@ int main(int argc, char* argv[]) {
         });
         try {
             server.Start(g_stop);
+        } catch (const std::exception& ex) {
+            g_stop = true;
+            if (monitorThread.joinable()) {
+                monitorThread.join();
+            }
+            Logger::Instance().Error("Failed to start proxy server: {Error}", ex.what());
+            monitoring.PrepareRestartAfterDelay(NetworkMonitoring::StartupRestartDelaySec, g_stop);
+            restartAfterCleanup = monitoring.RestartRequested();
         } catch (...) {
             g_stop = true;
             if (monitorThread.joinable()) {
                 monitorThread.join();
             }
-            throw;
+            Logger::Instance().Error("Failed to start proxy server: unknown error.");
+            monitoring.PrepareRestartAfterDelay(NetworkMonitoring::StartupRestartDelaySec, g_stop);
+            restartAfterCleanup = monitoring.RestartRequested();
         }
 
-        g_stop = true;
-        if (monitorThread.joinable()) {
-            monitorThread.join();
+        if (!restartAfterCleanup) {
+            g_stop = true;
+            if (monitorThread.joinable()) {
+                monitorThread.join();
+            }
+            restartAfterCleanup = monitoring.RestartRequested();
         }
-        restartAfterCleanup = monitoring.RestartRequested();
 
         Logger::Instance().Info("SOCKS5 proxy server stopped gracefully.");
         exitCode = 0;
+        }
     } catch (const std::exception& ex) {
         Logger::Instance().Error("Fatal error occurred: {Error}", ex.what());
         exitCode = 5;

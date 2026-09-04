@@ -200,10 +200,15 @@ uint16_t DnsClient::GenerateId() {
     return static_cast<uint16_t>(dist(rng));
 }
 
-void DnsClient::Cache(const std::string& domain, const DnsResult& result) {
+void DnsClient::Cache(const std::string& domainRaw, const DnsResult& result) {
     if (!result.fromNetwork) {
         return;
     }
+    if (domainRaw.empty()) {
+        return;
+    }
+
+    const std::string domain = ToLower(domainRaw);
 
     std::lock_guard lock(cacheMutex_);
     if (cache_.size() >= 10000) {

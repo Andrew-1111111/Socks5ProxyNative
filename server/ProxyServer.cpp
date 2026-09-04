@@ -1,14 +1,26 @@
 #include "ProxyServer.h"
 
-#include "protocol/Socks5Session.h"
 #include "../config/NetworkConfiguration.h"
 #include "../network/Network.h"
 #include "../utils/Logger.h"
+#include "protocol/Socks5Session.h"
+#include <dns/DnsResolver.h>
+#include <friendly/FriendlyNameResolver.h>
+#include <network/Iocp.h>
+#include <network/TcpAcceptor.h>
 
+#include <atomic>
 #include <chrono>
 #include <exception>
+#include <memory>
+#include <mutex>
+#include <semaphore>
 #include <stdexcept>
 #include <thread>
+#include <vector>
+#include <Windows.h>
+#include <WinSock2.h>
+#include <ws2def.h>
 
 ProxyServer::ProxyServer(FriendlyNameResolver& resolver)
     : resolver_(resolver) {}

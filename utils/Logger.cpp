@@ -41,6 +41,7 @@ Style StyleLevel(LogLevel level) {
     case LogLevel::Info: return {kWhite};
     case LogLevel::Warning: return {kYellow};
     case LogLevel::Error: return {kWhite, kRedBg};
+    case LogLevel::Off: return {kGray};
     }
     return {kWhite};
 }
@@ -80,6 +81,7 @@ const char* LevelNameLocal(LogLevel level) {
     case LogLevel::Info: return "INF";
     case LogLevel::Warning: return "WRN";
     case LogLevel::Error: return "ERR";
+    case LogLevel::Off: return "OFF";
     }
     return "INF";
 }

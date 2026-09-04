@@ -2,7 +2,12 @@
 
 #include "../network/Network.h"
 
+#include <cstdint>
 #include <cstring>
+#include <string>
+#include <WinSock2.h>
+#include <ws2def.h>
+#include <ws2ipdef.h>
 
 std::string NetworkConfiguration::ListenIPAddress = "127.0.0.1";
 uint16_t NetworkConfiguration::ListenPort = 1080;

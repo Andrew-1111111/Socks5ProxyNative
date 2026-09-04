@@ -4,12 +4,16 @@
 #include "../friendly/FriendlyNameResolver.h"
 #include "../network/TcpAcceptor.h"
 
+#include <network/Iocp.h>
+
 #include <atomic>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <semaphore>
 #include <unordered_set>
+#include <WinSock2.h>
+#include <ws2def.h>
 
 class Socks5Session;
 

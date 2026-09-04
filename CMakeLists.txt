@@ -43,3 +43,55 @@ add_custom_command(TARGET Socks5Proxy POST_BUILD
     "${CMAKE_CURRENT_SOURCE_DIR}/proxy.json"
     "$<TARGET_FILE_DIR:Socks5Proxy>/proxy.json"
 )
+
+option(SOCKS5PROXY_BUILD_TESTS "Build unit tests" ON)
+if (SOCKS5PROXY_BUILD_TESTS)
+  enable_testing()
+  add_executable(Socks5Proxy.Tests
+    tests/main.cpp
+    tests/unit/DnsClientTests.cpp
+    tests/unit/ProxyConfigurationTests.cpp
+    tests/unit/NetworkUtilsTests.cpp
+    tests/unit/FriendlyNameResolverTests.cpp
+    tests/unit/Socks5ConstantsTests.cpp
+    tests/unit/NetworkMonitoringTests.cpp
+    tests/unit/NetworkConfigurationTests.cpp
+    tests/unit/LoggerTests.cpp
+    tests/unit/ApplicationTests.cpp
+    tests/unit/GssapiContextTests.cpp
+    tests/unit/IocpTests.cpp
+    tests/unit/TcpAcceptorTests.cpp
+    tests/unit/DnsResolverTests.cpp
+    tests/integration/IntegrationTests.cpp
+    dns/DnsClient.cpp
+    dns/DnsResolver.cpp
+    config/ProxyConfiguration.cpp
+    config/NetworkConfiguration.cpp
+    network/Network.cpp
+    network/Iocp.cpp
+    network/TcpAcceptor.cpp
+    utils/Logger.cpp
+    utils/Application.cpp
+    friendly/FriendlyNameResolver.cpp
+    helper/NetworkMonitoring.cpp
+    server/ProxyServer.cpp
+    server/protocol/GssapiContext.cpp
+    server/protocol/Socks5Session.cpp
+    server/protocol/UdpRelay.cpp
+  )
+  target_include_directories(Socks5Proxy.Tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration
+  )
+  target_compile_features(Socks5Proxy.Tests PRIVATE cxx_std_20)
+  if (WIN32)
+    target_compile_definitions(Socks5Proxy.Tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+    target_link_libraries(Socks5Proxy.Tests PRIVATE ws2_32 mswsock iphlpapi shell32 advapi32 secur32)
+  endif()
+  if (MSVC)
+    target_compile_options(Socks5Proxy.Tests PRIVATE /Gy)
+    target_link_options(Socks5Proxy.Tests PRIVATE /OPT:REF)
+  endif()
+  add_test(NAME Socks5Proxy.Tests COMMAND Socks5Proxy.Tests --no-pause)
+endif()
